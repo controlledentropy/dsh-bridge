@@ -4,6 +4,10 @@ node_modules/
 .state/
 .state-*/
 
+# dsh plugins drop their own caches into the directory they were started from - which, when the
+# bridge cold-boots dsh web, is this source tree (measured: .dsh-mattskillsdeck-cache/logs/*.log).
+.dsh-*/
+
 # Belt and braces: DSH_BRIDGE_STATE can be pointed anywhere, so name the sensitive files too.
 sessions.json
 sessions.json.lock

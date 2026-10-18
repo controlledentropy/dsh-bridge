@@ -69,7 +69,7 @@ Codex / Claude Desktop / Cursor
 前提：已安装并能运行 [`@deepseek-ai/dsh`](https://www.npmjs.com/package/@deepseek-ai/dsh)，本机有 Node.js **≥ 18.14**（需要 `headers.getSetCookie()`）。
 
 ```bash
-git clone <your-repository-url>
+git clone https://github.com/controlledentropy/dsh-bridge.git
 cd dsh-bridge
 npm install
 npm test                    # 离线契约及 MCP 子进程测试；不启动 dsh web，不消耗模型额度
@@ -77,7 +77,7 @@ node launch.mjs resolve     # 确认 Node / dsh 路径和版本
 node launch.mjs check       # 预检版本和 profile；不启动 dsh web 服务
 ```
 
-> 将 `<your-repository-url>` 替换为仓库发布后的实际 GitHub 地址。`npm install` 需要正常获取 npm 依赖；`npm test` 会运行测试子进程，但不需要连接 `dsh web` 或消耗模型额度。`node launch.mjs check` **会启动一次短生命周期的 `dsh --profile web --dump-config` 命令**（默认最多等待 25 秒），但不会启动 web 服务；一小时内命中 `check.json` 缓存时可跳过该检查。
+>`npm install` 需要正常获取 npm 依赖；`npm test` 会运行测试子进程，但不需要连接 `dsh web` 或消耗模型额度。`node launch.mjs check` **会启动一次短生命周期的 `dsh --profile web --dump-config` 命令**（默认最多等待 25 秒），但不会启动 web 服务；一小时内命中 `check.json` 缓存时可跳过该检查。
 
 ### 2. 启动或连接 `dsh web`
 
@@ -194,7 +194,9 @@ dsh_status {alias}                 查看模型、token 用量和上下文压力
 
 会话的写入边界就是它的 `cwd`。**任务文本里出现工作区之外的绝对路径时，`dsh_launch` / `dsh_send` 直接拒绝下发**（错误里列出这些路径），因为那一轮注定被沙箱拒绝、只会白烧额度；确属只读引用时传 `allowOutsideCwd: true` 放行，返回里会带 `warnings` 与 `outsideCwd`。任务要改动别的仓库时，以那个仓库作为 `cwd` 建会话（侧边栏分栏跟随 `cwd`），不要在 A 工作区的会话里写 B 目录。
 
-一轮可能横跨数百条事件，所以判决读取是**从本轮 baseline 起、逐级加宽窗口（24 → 200 → 1000）直到本轮自己的 `turn/end` 落进窗口，再截断到该事件**：既不会把下一轮的 `completed` 当成本轮结论，也不会因为窗口太小把已中止的一轮读成"什么都没发生"。返回里的 `windowTruncated` 表示窗口没覆盖到日志末尾，`verdictComplete` 表示本轮判决确实在窗口内——两者要一起看。中止还会带 `abortReason`（实测 `user` 表示是人中止的，不是 dsh 自己放弃）。
+一轮可以横跨上千条事件，任何固定大小的窗口都是在猜本轮有多长，所以判决读取是**从本轮 baseline 起沿游标向前走（首页 24 条、之后每页 1000 条、上限 12 页）直到本轮自己的 `turn/end` 落进已读事件，再截断到该事件**：既不会把下一轮的 `completed` 当成本轮结论，也不会因为窗口够不到而把一个已完成的轮次读成 `idle`（即"什么都没发生"）。这两种翻车都实测过。返回里的 `windowTruncated` 表示窗口没覆盖到日志末尾，`verdictComplete` 表示本轮判决确实在窗口内——两者要一起看；`window.newestSeq` 只报截断后真正读到的位置。中止还会带 `abortReason`（实测 `user` 表示是人中止的，不是 dsh 自己放弃）。
+
+**`workspace-write` 不等于无人值守可用。** 实测：即便工作目录已授权，`pwsh` / git 这类操作仍会触发 dsh 的审批（`approval/asked`）并**停在人身上**，而 `session/list.running` 依然是 `true`，从外面看只是"跑得慢"。桥接因此把 `approvalPolicy` / `approvalAsked` / `approvals[]` / `pending[]`（尚无 `approval/decided` 的那些）一并返回，`dsh_wait` 一旦发现 `pending` 非空就立即返回而不是耗完窗口——继续等不会有人来点。要真正无人值守，会话需处于 `danger-full-access`（审批策略随之变 `never`）；派单前用 `dsh_status {alias}` 看 `approvalPolicy` 与 `unattended` 两个字段确认。
 
 沙箱档位与提权痕迹用 `dsh_permissions` 只读查看：生效档位、`escalated`、`escalatedBy`、审批策略变化（实测一次人工提权会同时把 `approval/policy` 从 `ask` 改成 `never`）。**提权前后的两轮环境前提不同，不能互相取证。**
 
@@ -207,8 +209,8 @@ dsh_status {alias}                 查看模型、token 用量和上下文压力
 | `dsh_launch` | `alias`, `cwd`, `task`; 可选 `phase`, `group`, `dryRun`, `allowOutsideCwd`, `model`, `reasoningEffort` | 新建命名会话、设置模型并提交第一轮；`dryRun` 只创建会话，不执行任务 |
 | `dsh_send` | `alias`, `task`; 可选 `allowOutsideCwd`, `model`, `reasoningEffort` | 向同一会话提交下一轮 |
 | `dsh_adopt` | `alias`, `sessionId`, `cwd`; 可选 `phase` 等 | 接管已存在的 `dsh web` 会话，不改变其分栏 |
-| `dsh_wait` | `alias`; 可选 `maxSeconds`（≤ 45） | 在限定时间内等待本轮完成或返回当前状态 |
-| `dsh_status` | `alias` | 返回本轮状态、模型、token 用量、上下文压力、待答问题，以及会话边界信息：`workingDirectory`、`sandbox`（如 `workspace-write`）、`agentPreset`、`sessionStats` |
+| `dsh_wait` | `alias`; 可选 `maxSeconds`（≤ 45） | 在限定时间内等待本轮完成；返回本轮自己的判决（`state` / `verdictComplete`），若本轮停在人工审批上则立即返回 `pending[]` 而不空等 |
+| `dsh_status` | `alias` | 返回本轮状态、模型、token 用量、上下文压力、待答问题，以及会话边界信息：`workingDirectory`、`sandbox`（如 `workspace-write`）、`agentPreset`、`approvalPolicy` / `unattended`（能否无人值守）、`sessionStats` |
 | `dsh_result` | `alias`; 可选 `messages`（≤ 40）、`round` | 获取某一轮（默认最新一轮）的验收载荷：助手文本、工具调用、落盘文件、`toolErrors[]`（含失败正文与错误码）、`sandboxDenials`、`window` / `windowTruncated` / `verdictComplete` |
 | `dsh_sessions` | 可选 `cwd` | 查看桥接持有的别名；传入 `cwd` 时额外查询该工作区的活会话 |
 | `dsh_cancel` | `alias` | 请求取消当前轮；需再次检查最终状态 |
@@ -309,7 +311,7 @@ node launch.mjs stop        # 仅停止桥接记录为自己管理的实例
 ### 契约测试与诊断工具
 
 ```bash
-npm test                                  # 20 个离线契约 / MCP 子进程测试
+npm test                                  # 30 个离线契约 / MCP 子进程测试
 node tests/live-check.mjs                 # 已运行实例的只读复验（需能读取当前实例的启动 token）
 node tools/probe-api.mjs                  # 探查 /api 端点参数形状
 node tools/probe-acp.mjs                  # 检查 ACP 接口
@@ -364,10 +366,12 @@ GitHub Actions 工作流配置在 Linux / Windows、Node.js 20 / 22 上运行离
 | 会话未出现在预期侧边栏 | 创建时未关联正确 workspace | 新建会话并启用自动分栏；已接管会话无法通过桥接改组 |
 | MCP 客户端面板未显示工具 | 某些客户端不会展示完整工具列表 | 尝试直接调用 `dsh_models`，查看 `bridge.log.jsonl` 中的 `ev:"tool"` |
 | 返回 `idle` 或 `accepted: true` | 还没有可确认的完成记录 | 继续查询状态；绝不据此宣称任务完成 |
+| 一轮长时间 `running` 却毫无进展，或 `dsh_wait` 返回的 `pending` 非空 | 会话审批策略是 `ask`，某个操作停在人工确认上（实测 `pwsh` / git 会触发），而 `session/list.running` 仍是 `true` | 到 dsh UI 回答该审批，或把会话档位提到 `danger-full-access`（策略随之变 `never`）后重发；继续 `dsh_wait` 不会有人来点。派单前先看 `dsh_status` 的 `unattended` |
 | `sandboxDenials > 0`、正文出现 `file access denied` / `EPERM` | 任务要写的目录在会话工作区之外 | 以目标目录为 `cwd` 重开会话；不要指望"提权重试"提示，无人值守时没人能批准 |
 | `run_code` 报 `ENOENT …\undefined\temp\…` 或写 `%TEMP%` 报 `EPERM` | dsh 的 `run_code` 会清空进程环境，`os.tmpdir()` 因此拼出相对路径；写真实 TEMP 又被沙箱拒绝 | 任务包里显式规定临时文件写在会话工作区内的绝对路径 |
 | 子进程"没有输出也没有退出码"（例如 git 明明装了） | 宿主环境 `PATHEXT` 不含 `.EXE`（打包应用的子进程环境可能不是注册表那份），PowerShell 会静默不启动 | `node launch.mjs doctor` 的 `env.problems` 会直接报出来；对比注册表 `Session Manager\Environment` 的值 |
 | dsh 设置里 Agent presets 只剩两个 | `ptc` / `minimal` 需要 Developer tools 偏好开启，而该偏好被 profile 补丁写成了 `enabled: false` | 与桥接无关：`agentPresets/list` 仍返回全部档位；在 dsh 设置里打开 Developer tools，或删掉 `profiles/<p>/cordis.patch.yml` 里的 `ui-settings` 覆盖 |
+| 源码目录里出现 `.dsh-*-cache/logs/*.log` | 由桥接冷启动的 `dsh web` 会把插件缓存写进自己的启动目录，也就是桥接源码目录 | 与桥接逻辑无关，已在 `.gitignore` 中忽略、不要提交；介意就按"长期本地部署"一节让 `dsh web` 在别处启动，桥接只负责连接 |
 
 ## 安全与使用边界
 

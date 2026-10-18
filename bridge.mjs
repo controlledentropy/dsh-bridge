@@ -26,7 +26,8 @@ import { HOST as LAUNCH_HOST, PORT as LAUNCH_PORT, STATE_DIR as LAUNCH_STATE, OU
   portOpen, tokenFrom, currentToken, start as launchStart } from './launch.mjs';
 import { ARGS, envelope, authCookie, pastCursor, parseAllowlist, allowedText, checkPolicy, splitModel,
   checkAlias, checkCwd, normCwd, roundRecord, baselineFrom, interpret, modelLabel,
-  unwrapProjections, pathsOutsideCwd, pageWindow as calcWindow, permissionHistory, sliceRound } from './lib/api-contract.mjs';
+  unwrapProjections, pathsOutsideCwd, pageWindow as calcWindow, permissionHistory, walkRound,
+  approvalState, PAGE_SIZE, MAX_PAGES } from './lib/api-contract.mjs';
 
 const num = (name, value, fallback) => {
   const n = Number(value);
@@ -235,13 +236,33 @@ function ensureServer() {
 const projections = (sessionId) => call('session/projections', ARGS.sessionProjections(sessionId)).then(unwrapProjections);
 async function asOf(sessionId) { try { return (await projections(sessionId))?.asOfSeq ?? 0; } catch { return 0; } }
 
-// What the session is actually allowed to touch. A task aimed outside this scope is denied by dsh's
-// sandbox and the failure only makes sense once you can see the scope, so it travels with every
-// dispatch reply.
+// What the session is actually allowed to touch, and whether it can run unattended at all: with
+// approval policy "ask" a single pwsh/git call can park the round on a human decision. The scope
+// travels with every dispatch reply, because a task aimed outside it is denied by dsh's sandbox and
+// the denial only makes sense once you can see the scope.
+// The policy lives only in the log, and a tail window misses the event that set it on a long session
+// (measured: policy flipped at seq 706, a 200-event tail started at 884 -> reported null, which reads
+// as "ask" and would wrongly rule out unattended dispatch). So scan backwards until one turns up;
+// policy changes are rare, and finding none is reported as null rather than guessed.
+async function currentApprovalPolicy(sessionId) {
+  let asOfSeq = await asOf(sessionId);
+  for (let page = 0; page < MAX_PAGES && asOfSeq > 0; page++) {
+    const from = Math.max(-1, asOfSeq - PAGE_SIZE);
+    const { events } = await pageWindow(sessionId, from, PAGE_SIZE).catch(() => ({ events: [] }));
+    const policies = events.filter((e) => e?.type === 'approval/policy');
+    if (policies.length) return policies[policies.length - 1].data?.policy ?? null;
+    if (from <= 0) break;
+    asOfSeq = from;
+  }
+  return null;
+}
+
 async function sessionScope(sessionId) {
   const p = await projections(sessionId).catch(() => null);
+  const policy = await currentApprovalPolicy(sessionId).catch(() => null);
   return { workingDirectory: p?.workingDirectory || null, sandbox: p?.permissions?.currentValue || null,
-    agentPreset: p?.agentPreset || null, model: modelLabel(p?.modelSelection?.lastUsed) };
+    agentPreset: p?.agentPreset || null, model: modelLabel(p?.modelSelection?.lastUsed),
+    approvalPolicy: policy, unattended: policy === 'never' };
 }
 
 // Reading asOfSeq first still races a live session, so "past cursor N" corrects the cursor instead
@@ -288,32 +309,29 @@ async function liveRow(sessionId, maxAgeMs = CFG.pollMs) {
 }
 const dropListCache = () => { listCache = { at: 0, items: null }; };
 
-// A round can span hundreds of events (measured: 200+ between dispatch and its own turn/end), so one
-// fixed window is not enough: too small and the verdict is missed, too wide and the NEXT round's
-// turn/end is read as this round's. Widen until the round's own turn/end is inside the window, then
-// cut the events at it. MEASURED: session/page treats maxMessages as a hint, not a cap (asking for 12
-// returned 74 records), and 1000 returns a whole 1445-event log with hasMore=false.
-const WINDOW_BUDGETS = [24, 200, 1000];
-async function readRoundEvents(sessionId, sinceSeq, budgets = WINDOW_BUDGETS) {
-  let last = { events: [], window: { sinceSeq, truncated: true } };
-  for (const maxMessages of budgets) {
-    try { last = await pageWindow(sessionId, sinceSeq, maxMessages); } catch { break; }
-    if (last.events.some((e) => e.type === 'turn/end')) break;
-    if (!last.window?.truncated) break;                    // the log really ends here: nothing more to find
-  }
-  return { ...last, events: sliceRound(last.events) };
-}
+// A round can span more events than one page holds (measured: 1080 events, verdict at seq 1084 while
+// a 1000-message window from the baseline stopped at 1004 - a COMPLETED round read back as "idle").
+// The walk itself is pure logic in the contract lib and is tested offline; this is only the network
+// page reader it walks over. `walk:false` keeps polling cheap: one small window, no verdict guarantee.
+const readRoundEvents = (sessionId, sinceSeq, opts) =>
+  walkRound((cursor, n) => pageWindow(sessionId, cursor, n), sinceSeq, opts);
 
-async function readRound(s, budgets = WINDOW_BUDGETS) {
+async function readRound(s, opts = {}) {
   const sinceSeq = lastRound(s).sinceSeq ?? 0;
-  const { events, window } = await readRoundEvents(s.sessionId, sinceSeq, budgets);
-  const p = await projections(s.sessionId).catch(() => null);
   const row = await liveRow(s.sessionId);
+  // Cheap first pass while the agent is still working; walk the whole round only when a verdict is
+  // actually possible, otherwise every poll re-reads a thousand events.
+  const settledHint = row?.running === false;
+  const { events, window } = await readRoundEvents(s.sessionId, sinceSeq,
+    { walk: opts.walk ?? settledHint, first: opts.first ?? 24 }).catch(() => ({ events: [], window: { sinceSeq, truncated: false } }));
+  const p = await projections(s.sessionId).catch(() => null);
   const r = interpret(events, row?.running ?? null);
-  // "I did not see the end of this round" must never be reported as "this round did not end".
+  const ap = approvalState(events);
   const unseen = !r.settled && window?.truncated;
-  return { ...r, window, windowTruncated: !!window?.truncated, verdictComplete: r.settled || !unseen,
-    ...(unseen ? { note: `no turn/end inside seq ${window.sinceSeq}..${window.throughSeq} of ${window.asOfSeq}; state is not a verdict - widen the window (dsh_result messages:N)` } : {}),
+  const blocked = !r.settled && ap.pending.length > 0;
+  return { ...r, ...ap, window, windowTruncated: !!window?.truncated, verdictComplete: r.settled || !unseen,
+    ...(blocked ? { note: `waiting on ${ap.pending.length} unanswered approval(s) - ${ap.pending.map((x) => x.toolName).join(', ')}; an unattended dispatch cannot proceed until a human answers in the dsh UI` }
+      : unseen ? { note: `no turn/end within seq ${window.sinceSeq}..${window.newestSeq} of ${window.asOfSeq}; state is not a verdict - re-read with dsh_result` } : {}),
     model: modelLabel(p?.modelSelection?.lastUsed || lastRound(s).pinned || s.pinned),
     tokenUsage: p?.tokenUsage || null, contextPressure: p?.contextPressure || null };
 }
@@ -400,10 +418,13 @@ async function dispatchRound(sessionId, task, requestId, { watchMs = CFG.watchMs
   let r = { settled: false, state: 'running' };
   while (Date.now() - started < watchMs) {
     await sleep(CFG.pollMs);
-    // Widening but capped: polling pays for every event it pulls, and a long round still settles -
-    // the authoritative read happens in dsh_wait/dsh_result, which escalates further.
-    const { events } = await readRoundEvents(sessionId, sinceSeq, [24, 200]).catch(() => ({ events: [] }));
-    r = interpret(events, (await liveRow(sessionId, 0))?.running ?? null);
+    // Polling reads the TAIL: the in-flight round is the newest activity, so its turn/end (when it
+    // lands) is at the end of the log, and walking the whole round on every poll would re-read
+    // thousands of events. The tail is then filtered to seq > baseline, because a 40-event tail on a
+    // freshly dispatched round still reaches back into the PREVIOUS round - whose turn/end would
+    // otherwise be reported as this round's verdict (a false "completed" before the agent even starts).
+    const { events } = await pageWindow(sessionId, sinceSeq, 40, 'tail').catch(() => ({ events: [] }));
+    r = interpret(events.filter((e) => e.seq > sinceSeq), (await liveRow(sessionId, 0))?.running ?? null);
     if (r.settled) return { ...head, ...r, elapsedMs: Date.now() - started };
     idlePolls = r.state === 'idle' ? idlePolls + 1 : 0;
     if (idlePolls >= 2) {
@@ -588,7 +609,7 @@ tool('dsh_adopt', {
 });
 
 tool('dsh_wait', {
-  description: 'Watch the current round until it settles or maxSeconds elapses. Keep maxSeconds <= 45 to stay under the MCP tool timeout; call again if it returns state "running".',
+  description: 'Watch the current round until it settles, parks on a human approval, or maxSeconds elapses. Keep maxSeconds <= 45 to stay under the MCP tool timeout; call again if it returns state "running".',
   inputSchema: { alias: z.string(), maxSeconds: z.number().int().min(1).max(45).default(40) },
 }, async ({ alias, maxSeconds }) => {
   try {
@@ -596,18 +617,25 @@ tool('dsh_wait', {
     const s = regGet(alias);                             // a wrong alias is refused without waking dsh
     await ensureServer();
     const started = Date.now();
-    let r = await readRound(s);                          // answer at once if it already settled
-    while (!r.settled && r.state !== 'idle' && Date.now() - started + CFG.pollMs < maxSeconds * 1000) {
+    // readRound walks the log only once dsh stops reporting the session as running: while the agent
+    // works, a poll is one small page; the moment a verdict is possible, the walk guarantees it is
+    // this round's own. Forcing the cheap pass here reported a COMPLETED round as "idle" (measured
+    // 2026-10-18: verdict at seq 1084, window stopped at 28) - and "idle" reads as "never dispatched".
+    let r = await readRound(s);                           // answer at once if it already settled
+    // Waiting cannot help while dsh is asking a human something: return the question instead of
+    // burning the whole window and reporting "running".
+    while (!r.settled && r.state !== 'idle' && !(r.pending || []).length && Date.now() - started + CFG.pollMs < maxSeconds * 1000) {
       await sleep(CFG.pollMs);
       r = await readRound(s);
     }
+    if (r.settled) await refreshOutcome(alias, lastRound(s).requestId, r.state);
     return json({ ok: true, alias, round: (s.rounds || []).length, requestId: lastRound(s).requestId || null,
       waitedMs: Date.now() - started, ...r });
   } catch (e) { return fail(e); }
 });
 
 tool('dsh_status', {
-  description: 'Immediate snapshot: current round state, model actually used, token usage, context pressure, pending plan, open user questions.',
+  description: 'Immediate snapshot: current round state, model actually used, token usage, context pressure, pending plan, open user questions, and whether the session can run unattended at all (approvalPolicy/unattended - policy "ask" parks a round on a human).',
   inputSchema: { alias: z.string() },
 }, async ({ alias }) => {
   try {
@@ -615,7 +643,11 @@ tool('dsh_status', {
     const s = regGet(alias);                             // a wrong alias is refused without waking dsh
     await ensureServer();
     const p = await projections(s.sessionId).catch(() => null);
+    // The policy in effect NOW, not the one this round's events happen to contain: a human may have
+    // escalated after the round ended, and "can I dispatch unattended" is about the present.
+    const scope = await sessionScope(s.sessionId).catch(() => null);
     return json({ ok: true, alias, round: (s.rounds || []).length, ...await readRound(s),
+      approvalPolicy: scope?.approvalPolicy ?? null, unattended: scope?.unattended ?? null,
       plan: p?.plan, userQuestions: p?.userQuestions, workingDirectory: p?.workingDirectory,
       sandbox: p?.permissions?.currentValue || null, permissions: p?.permissions || null,
       agentPreset: p?.agentPreset || null, sessionStats: p?.sessionStats || null,
@@ -637,7 +669,7 @@ tool('dsh_result', {
     const rounds = s.rounds || [];
     const target = round ? rounds[round - 1] : rounds[rounds.length - 1];
     if (!target) return fail(new Error(`alias "${alias}" has no rounds yet${round ? ` (asked for round ${round})` : ''}`));
-    const { events, window } = await readRoundEvents(s.sessionId, target.sinceSeq ?? 0, [messages, ...WINDOW_BUDGETS]);
+    const { events, window } = await readRoundEvents(s.sessionId, target.sinceSeq ?? 0, { walk: true, first: messages });
     const p = await projections(s.sessionId).catch(() => null);
     const r = interpret(events, (await liveRow(s.sessionId))?.running ?? null);
     const unseen = !r.settled && window?.truncated;

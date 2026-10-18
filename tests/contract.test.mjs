@@ -11,7 +11,8 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { ARGS, envelope, authCookie, pastCursor, parseAllowlist, allowedText, checkPolicy, splitModel,
   modelLabel, ALIAS_RE, checkAlias, checkCwd, normCwd, roundRecord, baselineFrom, interpret, argText,
-  unwrapProjections, pathsOutsideCwd, pageWindow, sliceRound, permissionHistory } from '../lib/api-contract.mjs';
+  unwrapProjections, pathsOutsideCwd, pageWindow, sliceRound, permissionHistory, approvalState,
+  walkRound } from '../lib/api-contract.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const PKG = path.resolve(HERE, '..');
@@ -282,4 +283,82 @@ test('sandboxDenials counts denials, not every error dsh annotates', () => {
   assert.equal(r.toolErrorCount, 4);
   assert.equal(r.sandboxDenials, 2, 'only the EPERM and the explicit access-denied bodies are denials');
   assert.equal(r.state, 'error');
+});
+
+test('approvalState separates "working" from "waiting for a human"', () => {
+  // MEASURED 2026-10-18: under approval policy "ask" a pwsh/git operation emits approval/asked and the
+  // round just sits there. session/list still says running:true, so polling alone cannot tell an
+  // unattended dispatch that it will never finish without somebody at the dsh UI.
+  const events = [
+    { seq: 2, type: 'approval/policy', data: { policy: 'ask' } },
+    { seq: 651, type: 'approval/asked', data: { id: 'a1', toolName: 'pwsh', callId: 'c1', reason: 'command  writes   outside the workspace' } },
+    { seq: 652, type: 'approval/decided', data: { id: 'a1', outcome: 'allowed-once' } },
+    { seq: 678, type: 'approval/asked', data: { id: 'a2', toolName: 'git', callId: 'c2', reason: 'push needs network' } },
+    { seq: 679, type: 'approval/decided', data: { id: 'a2', outcome: 'cancelled' } },
+    { seq: 702, type: 'approval/asked', data: { id: 'a3', toolName: 'pwsh', callId: 'c3', reason: 'rm -rf needs confirmation' } }];
+  const a = approvalState(events);
+  assert.equal(a.approvalPolicy, 'ask');
+  assert.equal(a.approvalAsked, 3);
+  assert.deepEqual(a.pending.map((p) => p.id), ['a3'], 'only the unanswered one blocks');
+  assert.deepEqual(a.approvals.map((x) => x.outcome), ['allowed-once', 'cancelled', null]);
+  assert.equal(a.approvals[0].reason, 'command writes outside the workspace', 'reason is normalised, not truncated mid-word');
+  assert.equal(interpret(events, true).state, 'running', 'the log alone says "running" - that is the trap');
+  assert.deepEqual(approvalState([{ seq: 2, type: 'approval/policy', data: { policy: 'never' } }]),
+    { approvalPolicy: 'never', approvalAsked: 0, approvals: [], pending: [] }, 'a full-access session never blocks');
+  assert.deepEqual(approvalState([{ seq: 9, type: 'approval/asked', data: { toolName: 'pwsh' } }]).pending.length, 1,
+    'an ask with no id cannot be matched to a decision, so it stays pending');
+  assert.deepEqual(approvalState([]).approvalPolicy, null);
+});
+
+test('walkRound pages to a verdict that one window cannot reach', () => {
+  // The measured incident: baseline seq 4, verdict at 1084, log at 1445, next round's verdict at 1444.
+  const log = [];
+  for (let s = 5; s <= 1200; s++) log.push({ seq: s, type: 'step/start', data: { turn: 1, step: s } });
+  log.push({ seq: 1084, type: 'turn/end', data: { reason: { kind: 'completed' } } });
+  log.push({ seq: 1444, type: 'turn/end', data: { reason: { kind: 'error', error: { code: 'NEXT', message: 'a later round' } } } });
+  log.sort((x, y) => x.seq - y.seq);
+  const asOfSeq = 1445;
+  const calls = [];
+  const page = (cursor, n) => {
+    const w = pageWindow({ sinceSeq: cursor, asOfSeq, maxMessages: n });
+    const events = log.filter((e) => e.seq > w.sinceSeq && e.seq <= w.throughSeq);
+    calls.push({ cursor, n, throughSeq: w.throughSeq });
+    return { events, window: { ...w, asOfSeq, oldestSeq: events[0]?.seq ?? null,
+      newestSeq: events[events.length - 1]?.seq ?? null, truncated: asOfSeq > w.throughSeq } };
+  };
+
+  // What the old single-window read did, kept as the regression it is.
+  const oneShot = page(4, 1000);
+  assert.equal(oneShot.window.throughSeq, 1004, 'a 1000-message window from the baseline stops short of seq 1084');
+  assert.equal(interpret(oneShot.events, false).state, 'idle', 'and a completed round then reads as "nothing happened"');
+
+  return walkRound(page, 4, { walk: true, first: 24 }).then((r) => {
+    assert.equal(interpret(r.events, false).state, 'completed', 'the walk reaches the round\'s own verdict');
+    assert.equal(r.events[r.events.length - 1].seq, 1084, 'and stops there - seq 1444 belongs to the next round');
+    assert.equal(r.window.pages, 3);
+    assert.equal(r.window.truncated, false);
+    assert.equal(r.window.newestSeq, 1084);
+    assert.deepEqual(calls.slice(1).map((c) => c.n), [24, 1000, 1000], 'polling stays cheap until a verdict is wanted');
+  });
+});
+
+test('walkRound honours walk:false and the page cap', async () => {
+  const log = [];
+  for (let s = 1; s <= 5000; s++) log.push({ seq: s, type: 'step/start', data: {} });
+  const asOfSeq = 5000;
+  const page = (cursor, n) => {
+    const w = pageWindow({ sinceSeq: cursor, asOfSeq, maxMessages: n });
+    const events = log.filter((e) => e.seq > w.sinceSeq && e.seq <= w.throughSeq);
+    return { events, window: { ...w, asOfSeq, oldestSeq: events[0]?.seq ?? null,
+      newestSeq: events[events.length - 1]?.seq ?? null, truncated: asOfSeq > w.throughSeq } };
+  };
+  const cheap = await walkRound(page, 0, { walk: false, first: 24 });
+  assert.equal(cheap.window.pages, 1, 'a poll reads one small page');
+  assert.equal(cheap.window.newestSeq, 24);
+  assert.equal(cheap.window.truncated, true, 'and says so, instead of implying a verdict');
+
+  const capped = await walkRound(page, 0, { walk: true, first: 24, maxPages: 2 });
+  assert.equal(capped.window.pages, 2, 'an unsettled round cannot page forever');
+  assert.equal(capped.window.truncated, true);
+  assert.equal(interpret(capped.events, false).state, 'idle', 'no turn/end means no verdict, whatever the flag says');
 });

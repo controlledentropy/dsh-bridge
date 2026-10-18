@@ -61,9 +61,11 @@ POST /api/<endpoint>
 
 **`File sandbox: <mode>.` 是脚注，不是拒绝信号**：dsh 会给各种失败的工具结果都追加这一行（实测一个会话里 8 条 `isError` 结果**全部**带它，其中真正的拒绝只有 1 条）。判拒绝只认 `file access denied` / `escalation available` / `EPERM` / `operation not permitted`。
 
-**判决必须取自本轮自己的 `turn/end`**：`turn/end.data.reason` 是 `{kind}`，中止时还带嵌套来源 —— 实测 `{"kind":"aborted","reason":{"kind":"user"}}`，据此能区分"操作者中止"与"dsh 自己放弃"。而一轮可能横跨数百条事件（实测该轮 seq 5→206），所以：按 `throughSeq=asOfSeq` 的**尾部**窗口读会把**下一轮**的 `completed` 当成本轮结论（实测尾部窗口读到 seq 1444 的 completed），而固定小窗口的**基线**读又够不到本轮判决 → 正确做法是从本轮 baseline 起读、逐级加宽窗口（24 → 200 → 1000）直到本轮的 `turn/end` 落进窗口，再截断到该 `turn/end`。窗口没覆盖全日志时要显式区分"没看到结束"与"没有结束"（桥接回 `windowTruncated` 与 `verdictComplete` 两个字段）。
+**判决必须取自本轮自己的 `turn/end`**：`turn/end.data.reason` 是 `{kind}`，中止时还带嵌套来源 —— 实测 `{"kind":"aborted","reason":{"kind":"user"}}`，据此能区分"操作者中止"与"dsh 自己放弃"。而一轮可以横跨上千条事件，任何**固定**窗口都是在猜本轮有多长，两种猜法都实测翻过车：按 `throughSeq=asOfSeq` 的**尾部**窗口读会把**下一轮**的 `completed` 当成本轮结论（实测尾部窗口读到 seq 1444 的 completed）；从 baseline 起的单个 1000 条窗口又**够不到**本轮判决（实测本轮 baseline=4、`turn/end` 在 seq 1084，而窗口 `throughSeq` 只到 1004 → 一个 `completed` 的轮次被读成 `idle`，即"本轮什么都没发生"）。正确做法是**从本轮 baseline 起沿游标向前走**（`walkRound`：首页 24 条，之后每页 1000 条，上限 12 页），直到本轮的 `turn/end` 落进已收集事件，再截断到该 `turn/end`（`sliceRound`）。轮询时传 `walk:false` 只读一小页省钱，但此时**不得**把 `state` 当判决；桥接用 `windowTruncated` 与 `verdictComplete` 两个字段显式区分"没看到结束"与"没有结束"，并在 `window.newestSeq` 里只报**截断后**真正读到的位置。
 
 **提权痕迹可读**：`permission/preset {preset}`、`sandbox/mode {mode,source?}`、`approval/policy {policy}`、`command/run {commandId,name,args?,source:{kind}}`。实测一次人工提权留下：seq 0 `workspace-write` → seq 207 `command/run name:"permission" args:" danger-full-access" source:{kind:"user"}` → seq 208 `danger-full-access`、seq 210 `approval/policy: never`。**提权前后两轮的环境前提不同，不能互相取证。**
+
+**审批会让一轮"停在人身上"，而日志看起来只是 running**：`approval/policy: ask`（`workspace-write` 档位的默认策略）下，dsh 不肯静默执行的操作会发 `approval/asked {id,toolName,callId,reason}` 并**等人回答**，`approval/decided {id,outcome}` 才关闭它（实测 outcome 有 `allowed-once`、`cancelled`）。此时 `session/list.running` 仍是 `true`，所以**光靠轮询无法区分"在干活"和"在等人"**——2026-10-18 实测：即使已授予工作目录写权限，`pwsh` / git 操作仍会弹审批，无人值守的一轮就此挂死。把档位提到 `danger-full-access` 会连带把策略翻成 `never`（实测 seq 703 `command/run` → 704 preset → 706 policy），这也是"睡觉/外出时才开 full"的技术原因。桥接因此把 `approvalPolicy` / `approvalAsked` / `approvals[]` / `pending[]`（asked 里没有对应 decided 的那些）一并回给调用方，`dsh_wait` 一旦发现 `pending` 非空就**立即返回**而不是耗完窗口。
 
 **成败判定**：只有 `turn/end.data.reason.kind`（`completed` / `error` / `aborted` …）。`accepted:true` 与 `running` 由 true→false 都**不能**判成败；失败轮的 `reason.error.{code,message}` 里才有真因。
 
