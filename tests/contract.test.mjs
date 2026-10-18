@@ -8,7 +8,8 @@ import assert from 'node:assert/strict';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { ARGS, envelope, authCookie, pastCursor, parseAllowlist, allowedText, checkPolicy, splitModel,
-  modelLabel, ALIAS_RE, checkAlias, checkCwd, normCwd, roundRecord, baselineFrom, interpret, argText } from '../lib/api-contract.mjs';
+  modelLabel, ALIAS_RE, checkAlias, checkCwd, normCwd, roundRecord, baselineFrom, interpret, argText,
+  unwrapProjections, pathsOutsideCwd } from '../lib/api-contract.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const PKG = path.resolve(HERE, '..');
@@ -151,4 +152,58 @@ test('roundRecord persists the handle, never the audit payload', () => {
   const rec = roundRecord({ requestId: 'r1', sinceSeq: 9, correlated: true, dispatchedAt: 't', state: 'completed', lastAssistantText: 'x'.repeat(999) }, 'p/m');
   assert.deepEqual(rec, { requestId: 'r1', sinceSeq: 9, correlated: true, dispatchedAt: 't', outcome: 'completed', pinned: 'p/m' });
   assert.equal(roundRecord({ requestId: 'r' }, undefined).pinned, null);
+});
+
+// Regression for the 2026-10-18 incident: the bridge reported "3 tool errors" with no bodies and
+// null permissions, so the caller could not tell a sandbox denial from a tool bug.
+test('unwrapProjections lifts the nested values envelope (as dsh actually answers)', () => {
+  // MEASURED shape of session/projections: kind + asOfSeq at the top, everything else under values.
+  const wire = { kind: 'session', asOfSeq: 206, values: {
+    permissions: { currentValue: 'workspace-write' }, agentPreset: 'ptc',
+    workingDirectory: 'D:\\repo\\research', tokenUsage: { outputTokens: 18280 },
+    modelSelection: { lastUsed: { provider: 'workbuddy', model: 'deepseek-v4.1-flash', reasoningEffort: 'max' } },
+    userQuestions: { active: [], settled: [] }, plan: { active: false, pending: false } } };
+  const p = unwrapProjections(wire);
+  assert.equal(p.asOfSeq, 206, 'cursor stays readable after unwrapping');
+  assert.equal(p.permissions.currentValue, 'workspace-write');
+  assert.equal(p.agentPreset, 'ptc');
+  assert.equal(p.tokenUsage.outputTokens, 18280);
+  assert.equal(modelLabel(p.modelSelection.lastUsed), 'workbuddy/deepseek-v4.1-flash:max');
+  assert.deepEqual(unwrapProjections({ a: 1 }), { a: 1 }, 'a flat payload still passes through');
+  assert.equal(unwrapProjections(null), null);
+});
+
+test('interpret hands back the failing tool bodies, not just a count', () => {
+  // MEASURED shapes: tool/call carries {turn,step,callId,name,arguments}; tool/result carries
+  // {turn,step,message,isError,error{name,code}} and NO name - so they must be joined on (turn,step).
+  const events = [
+    { seq: 127, type: 'tool/call', data: { turn: 1, step: 12, callId: 'call_a', name: 'run_code', arguments: '{"code":"import x"}' } },
+    { seq: 137, type: 'tool/result', data: { turn: 1, step: 12, error: { name: 'CodeRunFailedError', code: 'CODE_RUN_FAILED' }, message: { isError: true, content: [{ type: 'text', text: "Error: code run failed (exception): 'import', and 'export' cannot be used outside of module code File sandbox: workspace-write." }] } } },
+    { seq: 138, type: 'tool/call', data: { turn: 1, step: 13, callId: 'call_b', name: 'run_code', arguments: '{}' } },
+    { seq: 147, type: 'tool/result', data: { turn: 1, step: 13, error: { name: 'CodeRunFailedError', code: 'CODE_RUN_FAILED' }, message: { isError: true, content: [{ type: 'text', text: 'Error: EPERM: operation not permitted, open \'C:\\Users\\x\\AppData\\Local\\Temp\\rc-1.out\'' }] } } },
+    { seq: 150, type: 'tool/result', data: { turn: 1, step: 14, message: { content: [{ type: 'text', text: 'ok' }] } } },
+    { seq: 151, type: 'turn/end', data: { reason: { kind: 'completed' } } }];
+  const r = interpret(events, false);
+  assert.equal(r.toolErrorCount, 2);
+  assert.equal(r.sandboxDenials, 2, 'both bodies mention the sandbox/EPERM, so the caller sees the class of failure');
+  assert.deepEqual(r.toolErrors.map((e) => e.seq), [137, 147]);
+  assert.deepEqual(r.toolErrors.map((e) => e.name), ['run_code', 'run_code'], 'name is recovered from the matching tool/call');
+  assert.deepEqual(r.toolErrors.map((e) => e.code), ['CODE_RUN_FAILED', 'CODE_RUN_FAILED']);
+  assert.match(r.toolErrors[0].body, /cannot be used outside of module code/);
+  assert.ok(r.toolErrors.every((e) => e.body.length <= 400), 'bodies are truncated, never dumped whole');
+  // a clean round must report nothing
+  const clean = interpret([{ seq: 2, type: 'tool/result', data: { turn: 1, step: 1, message: { content: [{ type: 'text', text: 'fine' }] } } },
+    { seq: 3, type: 'turn/end', data: { reason: { kind: 'completed' } } }], false);
+  assert.deepEqual(clean.toolErrors, []);
+  assert.equal(clean.sandboxDenials, 0);
+});
+
+test('pathsOutsideCwd flags the dispatch that the sandbox will deny', () => {
+  const WS = 'D:\\repo\\research';
+  assert.deepEqual(pathsOutsideCwd('在 D:\\repo\\checkout-x 里实现并跑测试', WS), ['D:\\repo\\checkout-x']);
+  assert.deepEqual(pathsOutsideCwd('把 docs/a.md 和 src\\b.ts 补测试', WS), [], 'relative paths are not warnings');
+  assert.deepEqual(pathsOutsideCwd('读取 D:\\repo\\research\\notes.md 后总结', WS), [], 'inside the workspace is not a warning');
+  assert.deepEqual(pathsOutsideCwd('普通中文任务，没有路径', WS), [], 'prose must not warn');
+  const many = pathsOutsideCwd('见 D:\\x\\one 和 D:\\x\\two 和 D:\\x\\three 和 D:\\x\\four 和 D:\\x\\five 和 D:\\x\\six 和 D:\\x\\seven 和 D:\\x\\eight 和 D:\\x\\nine', WS);
+  assert.ok(many.length <= 8, 'the advisory is capped, not a list of the whole task');
 });

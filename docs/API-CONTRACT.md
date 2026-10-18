@@ -40,7 +40,7 @@ POST /api/<endpoint>
 | `session/list` | `{_request:{}}` | `value.items[]`：`sessionId,cwd,running,blank,updatedAt,projections`。**不带 cwd 过滤会返回全部工作区的会话**（验证环境里 90+ 条），务必按 cwd 过滤 |
 | `session/create` | `{request:{sessionId, cwd}}` 或 `{request:{sessionId, workspaceId}}`（二者互斥） | `value:{sessionId,agentPreset}`。**`sessionId` 可自铸 → 这就是"命名会话"** |
 | `session/prompt` | `{request:{requestId,sessionId,mode:"queue"\|"steer",content:[{type:"text",text}]}}` | `value:{accepted:true}` —— **只代表受理**。同一 `requestId` 重复提交会被幂等吞掉（重试必须换 id） |
-| `session/projections` | `{request:{sessionId}}` | `asOfSeq,turnOutline[],tokenUsage,contextPressure,sessionStats,modelSelection{lastUsed,next},plan,userQuestions,workingDirectory,agentPreset`。**对非本进程建的会话可能整段缺 `turnOutline`/`modelSelection`**；`sessionListMetadata` 只有 `{blank,lastPromptAt}`，**没有 `running`** |
+| `session/projections` | `{request:{sessionId}}` | **载荷嵌在 `values` 里**：`{kind, asOfSeq, values:{title,goal,tokenUsage,contextPressure,contextBreakdown,inbox,sessionStats,turnOutline,agentPreset,userQuestions,workingDirectory,subagentCatalog,todos,plan,modelSelection,sessionListMetadata,imageLimits,permissions}}`。在顶层直接读 `plan`/`tokenUsage`/`permissions` 一律得到 `undefined`（本桥 2026-10-18 就是这么漏掉了沙箱模式与工具错误正文）。`asOfSeq` 确实在顶层。**对非本进程建的会话可能整段缺 `turnOutline`/`modelSelection`**；`sessionListMetadata` 只有 `{blank,lastPromptAt}`，**没有 `running`** |
 | `session/page` | `{request:{address:{kind:"session",sessionId}, throughSeq, maxMessages}}` | `{records:[{type:"event",event:{type,seq,time,data}}],hasMore}`。**`throughSeq` 必须 ≤ 当前 `asOfSeq`**，否则 `gateway/bad-request: … past cursor <N>`（`lib` 的 `pastCursor()` 取 N 当修正游标，先读 `asOfSeq` 再翻页仍会与活会话抢跑） |
 | `session/modelCatalog` | `{}`（**套 `_request` 会被拒**） | `{default,routableProviders,groups[{provider,models[]}],failures}`。模型条目**不声明支持哪些 reasoning effort** |
 | `session/selectModel` | `{request:{sessionId,provider,model,reasoningEffort}}` | `value:{selected:{…}}`；非法值 → `session/model-unavailable` 并说明原因（**这就是 effort 的探测手段，零消耗**） |
@@ -51,7 +51,9 @@ POST /api/<endpoint>
 | `session/search` | — | 默认禁用：`session search is disabled: session-query index openAt "never"` |
 | `session/follow`、`workspace/follow` | — | 流式方法必须走 `/api/remote.mux` WebSocket：`gateway/signature-invalid: stream Remote methods must be opened through the stream carrier` |
 
-会话事件的权威词汇（从 `session/page` 实测取到）：`session`、`permission/preset`、`sandbox/mode`、`approval/policy`、`subagent/model-selection-policy`、`agent/inbox/spliced`、`turn/start`、`step/start`、`system/message`、`user/message`、`request/header`、`request/context`、`session/title`、`assistant/message`、`tool/call`、`tool/result`、`workspace/changes`（**只带 `{turn}`，不带路径**）、`step/end`、`turn/end`。
+会话事件的权威词汇（从 `session/page` 实测取到）：`session`、`permission/preset`、`sandbox/mode`、`approval/policy`、`subagent/model-selection-policy`、`model/selection`、`agent/inbox/spliced`、`turn/start`、`step/start`、`system/message`、`user/message`、`request/header`、`request/context`、`session/title`、`session/title-llm-request`、`assistant/message`、`tool/call`、`tool/ptc-dispatch-start`、`tool/ptc-dispatch`、`tool/result`、`step/end`、`job/registered`、`job/settled`、`workspace/changes`（**只带 `{turn}`，不带路径**）、`turn/end`。PTC 预设的会话才会出现 `tool/ptc-dispatch*` 与 `job/*`。
+
+**工具调用的两个事件形状不同，必须按 `(turn, step)` 关联**：`tool/call` 带 `{turn,step,callId,name,arguments}`，而 `tool/result` 带 `{turn,step,message{isError,content},error{name,code}}` —— **结果里没有 name**。只读 `tool/result` 会得到"有 3 个错误但不知道是哪个工具"，这是审计最容易漏的地方（`CODE_RUN_FAILED` 即 `run_code`）。沙箱拒绝也**不是**服务端审批队列：它以 `isError` 的工具结果返回，dsh 把"可提权重试"的提示写在正文里（`sandbox: file access denied … escalation available …`）。
 
 **成败判定**：只有 `turn/end.data.reason.kind`（`completed` / `error` / `aborted` …）。`accepted:true` 与 `running` 由 true→false 都**不能**判成败；失败轮的 `reason.error.{code,message}` 里才有真因。
 

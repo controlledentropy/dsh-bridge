@@ -25,7 +25,8 @@ import path from 'node:path';
 import { HOST as LAUNCH_HOST, PORT as LAUNCH_PORT, STATE_DIR as LAUNCH_STATE, OUT_FILE as LAUNCH_OUT,
   portOpen, tokenFrom, currentToken, start as launchStart } from './launch.mjs';
 import { ARGS, envelope, authCookie, pastCursor, parseAllowlist, allowedText, checkPolicy, splitModel,
-  checkAlias, checkCwd, normCwd, roundRecord, baselineFrom, interpret, modelLabel } from './lib/api-contract.mjs';
+  checkAlias, checkCwd, normCwd, roundRecord, baselineFrom, interpret, modelLabel,
+  unwrapProjections, pathsOutsideCwd } from './lib/api-contract.mjs';
 
 const num = (name, value, fallback) => {
   const n = Number(value);
@@ -219,8 +220,18 @@ function ensureServer() {
   return ensuring;
 }
 
-const projections = (sessionId) => call('session/projections', ARGS.sessionProjections(sessionId));
+// The nested `values` envelope is unwrapped here so every caller sees one flat shape.
+const projections = (sessionId) => call('session/projections', ARGS.sessionProjections(sessionId)).then(unwrapProjections);
 async function asOf(sessionId) { try { return (await projections(sessionId))?.asOfSeq ?? 0; } catch { return 0; } }
+
+// What the session is actually allowed to touch. A task aimed outside this scope is denied by dsh's
+// sandbox and the failure only makes sense once you can see the scope, so it travels with every
+// dispatch reply.
+async function sessionScope(sessionId) {
+  const p = await projections(sessionId).catch(() => null);
+  return { workingDirectory: p?.workingDirectory || null, sandbox: p?.permissions?.currentValue || null,
+    agentPreset: p?.agentPreset || null, model: modelLabel(p?.modelSelection?.lastUsed) };
+}
 
 // Reading asOfSeq first still races a live session, so "past cursor N" corrects the cursor instead
 // of failing the call. throughSeq must be <= asOfSeq.
@@ -412,15 +423,22 @@ server.registerTool('dsh_launch', {
       workspaceId: ws?.workspaceId || null, workspaceTitle: ws?.title || null, adopted: false,
       created: existing?.created || new Date().toISOString(), rounds: existing?.rounds || [] });
     const pinned = await pinModel(sessionId, want);
+    const outside = pathsOutsideCwd(task, dir);
+    if (outside.length) log({ ev: 'cwd-advisory', alias, outside });
     if (dryRun) {
       return json({ ok: true, alias, sessionId, cwd: dir, grouped: !!ws, workspaceId: ws?.workspaceId || null,
         workspaceTitle: ws?.title || null, pinned, dispatched: false,
+        warnings: outside.length ? [`task names ${outside.length} path(s) outside the session workspace ${dir}; dsh's sandbox will deny writes there`] : [],
+        outsideCwd: outside, scope: await sessionScope(sessionId),
         note: 'dry run: session created and grouped, nothing dispatched' });
     }
+    const scope = await sessionScope(sessionId);
     const res = await dispatchRound(sessionId, task, `${alias}-r${entry.rounds.length + 1}-${Date.now().toString(36)}`);
     await appendRound(alias, { ...roundRecord(res, pinned), task });
     return json({ ok: true, alias, sessionId, cwd: dir, grouped: !!ws, workspaceTitle: ws?.title || null,
-      round: entry.rounds.length + 1, pinned, ...res });
+      round: entry.rounds.length + 1, pinned, scope,
+      warnings: outside.length ? [`task names ${outside.length} path(s) outside the session workspace ${dir}: ${outside.join(' , ')} - expect sandbox denials unless the task only reads them`] : [],
+      outsideCwd: outside, ...res });
   } catch (e) { return fail(e); }
 });
 
@@ -434,9 +452,14 @@ server.registerTool('dsh_send', {
     const want = assertModelAllowed(model, reasoningEffort);
     await ensureServer();
     const pinned = await pinModel(s.sessionId, want) || lastRound(s).pinned || s.pinned || null;
+    const outside = pathsOutsideCwd(task, s.cwd);
+    if (outside.length) log({ ev: 'cwd-advisory', alias, outside });
+    const scope = await sessionScope(s.sessionId);
     const res = await dispatchRound(s.sessionId, task, `${alias}-r${(s.rounds || []).length + 1}-${Date.now().toString(36)}`);
     const rounds = await appendRound(alias, { ...roundRecord(res, pinned), task });
-    return json({ ok: true, alias, sessionId: s.sessionId, round: rounds.length, pinned, ...res });
+    return json({ ok: true, alias, sessionId: s.sessionId, round: rounds.length, pinned, scope,
+      warnings: outside.length ? [`task names ${outside.length} path(s) outside the session workspace ${s.cwd}: ${outside.join(' , ')} - expect sandbox denials unless the task only reads them`] : [],
+      outsideCwd: outside, ...res });
   } catch (e) { return fail(e); }
 });
 
@@ -506,7 +529,9 @@ server.registerTool('dsh_status', {
     const p = await projections(s.sessionId).catch(() => null);
     return json({ ok: true, alias, round: (s.rounds || []).length, ...await readRound(s),
       plan: p?.plan, userQuestions: p?.userQuestions, workingDirectory: p?.workingDirectory,
-      agentPreset: p?.agentPreset || null, turnOutline: (p?.turnOutline || []).slice(-4),
+      sandbox: p?.permissions?.currentValue || null, permissions: p?.permissions || null,
+      agentPreset: p?.agentPreset || null, sessionStats: p?.sessionStats || null,
+      turnOutline: (p?.turnOutline || []).slice(-4),
       phase: s.phase || null, workspaceTitle: s.workspaceTitle || null,
       rounds: (s.rounds || []).map((r) => ({ requestId: r.requestId, outcome: r.outcome, pinned: r.pinned })) });
   } catch (e) { return fail(e); }
