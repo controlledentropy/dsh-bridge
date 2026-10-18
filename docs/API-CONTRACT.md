@@ -31,7 +31,7 @@ POST /api/<endpoint>
           | { "ok": false, "error": { "code": "…", "message": "…", "details": {…} } } }
 ```
 
-**参数包名靠网关错误逼出来**（文档里没有）：形状不对会回 `gateway/arguments-invalid: … args fields do not match the descriptor: missing "request"` / `unexpected "sessionId"`；缺 `args` 层则回 `gateway/internal: Remote payload must contain exactly one plain-object args field`。**照错误改，两三次就能收敛**——这也是升级后重建契约的标准手法。
+**参数包装的键名要靠网关的校验错误反推**（文档里没有）：形状不对会回 `gateway/arguments-invalid: … args fields do not match the descriptor: missing "request"` / `unexpected "sessionId"`；缺 `args` 层则回 `gateway/internal: Remote payload must contain exactly one plain-object args field`。**照错误改，两三次就能收敛**——这也是升级后重建契约的标准手法。
 
 ## 端点与参数形状（实测通过）
 
@@ -67,9 +67,9 @@ POST /api/<endpoint>
 - `dsh --profile acp`：标准 ACP v1 over stdio，**无鉴权**，`initialize/session/new|list|resume|close/prompt/cancel`；实测能接管 web 建的会话。`session/new` 的 `mcpServers` 是**必填**（哪怕空数组）；stdout 可能混入非协议日志行，客户端必须容忍。
 - `dsh --profile sdk`：私有 JSON-RPC stdio，另有 `session/wait`（整棵任务树静默）与全量 `session.event`。
 
-## 模型路由是 per-profile 的（很容易踩）
+## 模型路由是 per-profile 的（容易忽略）
 
-模型路由是 **per-profile** 的：manifest 里声明 `dsh.client.platform="web"` 的 provider 插件只会被组合进 web profile。把这类插件搬进 `acp`/`headless` 的结果是"provider 注册上了但模型目录为空"（我们踩过）。非 web profile 要用模型，只能靠它原生支持的凭据键（例如 `DEEPSEEK_API_KEY`）。
+模型路由是 **per-profile** 的：manifest 里声明 `dsh.client.platform="web"` 的 provider 插件只会被组合进 web profile。把这类插件搬进 `acp`/`headless` 的结果是"provider 注册上了但模型目录为空"。非 web profile 要用模型，只能靠它原生支持的凭据键（例如 `DEEPSEEK_API_KEY`）。
 
 `profile` 组合的排查命令（不启动进程）：`dsh --profile web --dump-config`；实测启动约 **10 秒**，所以 `startup_timeout_sec` 要留余量。
 
@@ -85,7 +85,7 @@ POST /api/<endpoint>
 npm test                       # 离线契约回归：线上格式一改就先红（零额度、无需 dsh）
 node launch.mjs check          # 版本 + profile 组合（不启动）；组合失败会复述 dsh 原文
 node launch.mjs doctor         # 解析→组合→端口→token→鉴权→modelCatalog
-node tools/probe-api.mjs       # 重新逼出各端点的 args 形状（只读 + 只建探针会话）
+node tools/probe-api.mjs       # 重新推导各端点的 args 形状（只读 + 只建探针会话）
 node tools/probe-acp.mjs       # ACP 面是否仍可用（无鉴权、方法表）
 node tests/live-check.mjs      # 对着活实例只读复验（--create / --dispatch 才产生代价）
 ```

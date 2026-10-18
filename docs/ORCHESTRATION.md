@@ -33,7 +33,7 @@
 
 要求执行方把结论写成工作区内的报告文件，是把"它自称完成"变成**可独立复核证据**最省事的做法。拿到结果后仍要抽查（读文件、跑命令）——**不接受未经验证的完成声明**。
 
-## 4. 判定铁律
+## 4. 判定规则
 
 - `accepted:true` 只代表受理；`running` 由 true 变 false **不代表成功**。只有 `state:"completed"` 算完成。
 - `state:"idle"` 意味着本轮没有记录任何 turn（任务被吞或接管被拒），必须按"未验证"处理。
@@ -69,4 +69,4 @@
 
 - 明确要停：`dsh_cancel {alias}`。它返回的 `accepted` 只是受理，要用 `dsh_wait` 复查是否真的落到 `aborted` / `idle`。
 - 桥接连不上（`unreachable` / `no launch token` / `/connect -> HTTP …`）属于**环境问题**：先跑 `node launch.mjs doctor`，把它的 `broken` 与 `problems` 原文带回来再决定处置（多半是"没有实例在跑"或"实例的 stdout 没被捕获"）。不要改成自己做然后声称外派过了，也不要凭猜测改配置。
-- 升级 dsh 之后：先 `node launch.mjs check`（不启动进程就能暴露版本不一致与 profile 配置被拒两类问题），再 `doctor`，再 `npm test`，最后**重看 `DSH_ALLOWED_MODELS` 是否仍表达你的本意**——修好一个配置缺陷可能会顺带扩大可选模型集。
+- 升级 dsh 之后：先 `node launch.mjs check`（不启动进程就能暴露版本不一致与 profile 配置被拒两类问题），再 `doctor`，再 `npm test`，最后**复核 `DSH_ALLOWED_MODELS` 是否仍符合预期**——修复一个配置缺陷可能同时扩大可选模型集。

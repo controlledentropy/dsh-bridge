@@ -115,7 +115,7 @@ dsh_adopt  {alias, sessionId, cwd}   # 接管 web UI 里已经开着的会话
 
 - 校验是**纯预检**：别名、路径、模型、推理强度任何一项不合规，请求在发出任何 `/api` 调用之前就被拒绝 —— 不冷启动 dsh、不建会话、不写账本。
 - 缺省值与允许清单冲突时，错误信息会标明冲突来自 `DSH_DEFAULT_MODEL/DSH_DEFAULT_EFFORT`，而不是让人误以为是调用方写错。
-- 模型目录在 dsh 启动后异步加载。桥接在 pin 之前会等目标 provider 出现（这个等待不消耗额度），因此自启动路径不会因为目录没热而白烧一轮。
+- 模型目录在 dsh 启动后异步加载。桥接在 pin 之前会等目标 provider 出现（这个等待不消耗额度），因此自启动路径不会因为目录尚未加载完成而空耗一轮。
 - dsh 的目录条目**不声明**各模型支持哪些推理强度，所以强度合法性只能由 dsh 判定（非法值报 `session/model-unavailable`）。
 
 ## 其余环境变量
@@ -165,12 +165,12 @@ node launch.mjs stop       # 只停 instance.json 里记录的 pid，不杀不�
 ```bash
 npm test                    # 离线：契约 + MCP 子进程，20 个用例，零额度
 node tests/live-check.mjs   # 对着活实例只读复验，不建会话、不消耗额度
-node tools/probe-api.mjs    # 重新逼出各端点的 args 形状（--mutate 才会建会话）
+node tools/probe-api.mjs    # 重新推导各端点的 args 形状（--mutate 才会建会话）
 node tools/probe-acp.mjs    # ACP 面是否仍可用（--prompt 才会下发）
 node tools/read-session-log.mjs <session.v4.jsonl.zstd>   # 多帧 zstd 会话日志解码
 ```
 
-`live-check` 有三个显式开启的、有代价的步骤，跳过时不会谎报为通过：
+`live-check` 有三个显式开启的、有代价的步骤，被跳过的步骤不计入通过：
 
 - `--adopt`：接管 `DSH_TEST_WS` 里一个空闲会话。不创建任何东西。
 - `--create`：两个并发 `dryRun` 启动，验证共享账本在并发下的合并。**会留下会话，而 API 删不掉它们**（`session/delete` 未转发），只能在 dsh 界面归档。
