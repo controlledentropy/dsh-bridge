@@ -12,6 +12,14 @@
     "agent",
     "orchestration"
   ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/controlledentropy/dsh-bridge.git"
+  },
+  "homepage": "https://github.com/controlledentropy/dsh-bridge#readme",
+  "bugs": {
+    "url": "https://github.com/controlledentropy/dsh-bridge/issues"
+  },
   "engines": {
     "node": ">=18.14.0"
   },
