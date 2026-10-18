@@ -1,0 +1,16 @@
+# Normalize line endings so the repo is identical on Linux/macOS and Windows.
+# The .mjs files carry a `#!/usr/bin/env node` shebang: a CRLF copy of that line breaks
+# `npm i -g` and any POSIX exec of the bridge.
+* text=auto eol=lf
+
+*.mjs text eol=lf
+*.js text eol=lf
+*.json text eol=lf
+*.md text eol=lf
+*.yml text eol=lf
+*.ps1 text eol=crlf
+
+*.zst binary
+*.zstd binary
+*.png binary
+*.jpg binary

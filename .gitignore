@@ -1,0 +1,27 @@
+# Dependencies and runtime state. Nothing here belongs in a hand-over: .state/ holds the session
+# ledger and, worse, dsh-web.out - an owner-level bearer token.
+node_modules/
+.state/
+.state-*/
+
+# Belt and braces: DSH_BRIDGE_STATE can be pointed anywhere, so name the sensitive files too.
+sessions.json
+sessions.json.lock
+instance.json
+check.json
+dsh-web.out
+dsh-web.err
+bridge.log.jsonl
+bridge.log.jsonl.1
+spawn.lock
+run/
+*.tmp
+
+# Probe output can carry a launch token; keep the markdown, not the captures.
+*.out
+*.ndjson
+*.har
+
+*.log
+.DS_Store
+Thumbs.db
