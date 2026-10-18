@@ -61,7 +61,12 @@ const client = await connect();
 try {
   await step('mcp handshake', async () => 'connected as an MCP child process');
   const { tools } = await client.listTools();
-  await step('tools/list', () => (tools.length === 9 ? `${tools.length} tools` : Promise.reject(new Error(`expected 9 tools, got ${tools.length}`))));
+  const expected = ['dsh_models', 'dsh_permissions', 'dsh_launch', 'dsh_send', 'dsh_adopt', 'dsh_wait', 'dsh_status', 'dsh_result', 'dsh_sessions', 'dsh_cancel'];
+  await step('tools/list', () => {
+    const got = tools.map((t) => t.name).sort();
+    if (JSON.stringify(got) !== JSON.stringify([...expected].sort())) throw new Error(`tool surface changed: ${got.join(', ')}`);
+    return `${got.length} tools`;
+  });
 
   const cat = await step('dsh_models (live catalog)', async () => {
     const j = await call(client, 'dsh_models', {});
@@ -73,6 +78,13 @@ try {
   await step('dsh_sessions (owned aliases)', async () => {
     const j = await call(client, 'dsh_sessions', {});
     return `${(j.owned || []).length} aliases in ${STATE}`;
+  });
+
+  await step('dsh_permissions (read-only sandbox surface)', async () => {
+    const j = await call(client, 'dsh_permissions', {});
+    if (!j.presets?.length) throw new Error('catalog came back empty: ' + JSON.stringify(j).slice(0, 200));
+    if (j.settableOverApi !== false) throw new Error('the bridge must not claim it can change the sandbox mode over /api');
+    return `${j.presets.join('|')} default=${j.defaultPreset}`;
   });
 
   const aliases = Object.keys(ledger());

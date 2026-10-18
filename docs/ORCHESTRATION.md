@@ -39,6 +39,8 @@
 - `state:"idle"` 意味着本轮没有记录任何 turn（任务被吞或接管被拒），必须按"未验证"处理。
 - `state:"error"` 时读 `error.{code,message}` 原文上报，**不要**擅自降级到别的模型重跑。
 - `dsh_result` 里的 `correlated:false` 表示本轮基线是靠游标推断而非按 `requestId` 关联得到的，此时结论可信度下降，验收要叠加磁盘级证据。
+- `verdictComplete:false`（配合 `windowTruncated:true`）表示**桥接没读到本轮的 `turn/end`**，不等于"本轮没结束"。此时不要下任何结论，先加大 `dsh_result {messages:N}` 的窗口重读。
+- `abortReason:"user"` 表示是人中止的（通常就是编排方自己调了 `dsh_cancel`），不是 dsh 放弃；两者处置完全不同。
 - 单次 `dsh_wait` 不要超过客户端的 `tool_timeout_sec`（默认建议 45s）；没落定就继续调用，而不是一次拉长。
 - `dsh_wait` / `dsh_result` 默认只回本轮内容；历史轮次要显式 `dsh_result {messages:N}`。
 
@@ -70,3 +72,12 @@
 - 明确要停：`dsh_cancel {alias}`。它返回的 `accepted` 只是受理，要用 `dsh_wait` 复查是否真的落到 `aborted` / `idle`。
 - 桥接连不上（`unreachable` / `no launch token` / `/connect -> HTTP …`）属于**环境问题**：先跑 `node launch.mjs doctor`，把它的 `broken` 与 `problems` 原文带回来再决定处置（多半是"没有实例在跑"或"实例的 stdout 没被捕获"）。不要改成自己做然后声称外派过了，也不要凭猜测改配置。
 - 升级 dsh 之后：先 `node launch.mjs check`（不启动进程就能暴露版本不一致与 profile 配置被拒两类问题），再 `doctor`，再 `npm test`，最后**复核 `DSH_ALLOWED_MODELS` 是否仍符合预期**——修复一个配置缺陷可能同时扩大可选模型集。
+
+## 9. 权限与沙箱
+
+- **会话的写入边界就是它的 `cwd`**，档位默认 `workspace-write`。任务要改哪个目录，就用那个目录建会话；侧边栏分栏跟随 `cwd`，不需要事后搬。
+- 桥接**拒绝**下发"任务文本里出现工作区外绝对路径"的派单，除非显式传 `allowOutsideCwd:true`（只读引用才该这么用）。这条硬阻断存在的原因：dsh 拒绝写入后给出的"可提权重试"提示，在无人值守场景里没有人能兑现，那一轮只会白烧额度。
+- **提权是人的动作，不是编排动作。** `/api` 上没有 per-session 的档位写入口（`permissionPresets/set`、`session/setSandboxMode` 均未转发），桥接也刻意不接 `commands/execute`。用 `dsh_permissions {alias}` 只读确认生效档位与提权痕迹（`escalated` / `escalatedBy` / `approvals`）。
+- **提权前后两轮不可互相取证**：一轮在 `workspace-write` 下失败、随后人工切到 `danger-full-access` 再跑，后者的"成功"不能证明前者是任务问题。审计时把档位变化写进结论。
+- 任务包里要显式规定临时文件位置：`run_code` 的进程环境被 dsh 清空，`os.tmpdir()` 会拼出 `<cwd>\undefined\temp` 而 ENOENT，写真 `%TEMP%` 又被沙箱拒绝。写成"临时文件放在会话工作区内的绝对路径"即可绕开。
+- 子进程"静默不执行"（有 exe、无输出、无退出码、无报错）先查宿主 `PATHEXT` 是否含 `.EXE`：`node launch.mjs doctor` 的 `env.problems` 会报。这类环境问题会被误读成"工具没装"，从而浪费好几轮排查。

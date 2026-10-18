@@ -26,7 +26,7 @@ import { HOST as LAUNCH_HOST, PORT as LAUNCH_PORT, STATE_DIR as LAUNCH_STATE, OU
   portOpen, tokenFrom, currentToken, start as launchStart } from './launch.mjs';
 import { ARGS, envelope, authCookie, pastCursor, parseAllowlist, allowedText, checkPolicy, splitModel,
   checkAlias, checkCwd, normCwd, roundRecord, baselineFrom, interpret, modelLabel,
-  unwrapProjections, pathsOutsideCwd } from './lib/api-contract.mjs';
+  unwrapProjections, pathsOutsideCwd, pageWindow as calcWindow, permissionHistory, sliceRound } from './lib/api-contract.mjs';
 
 const num = (name, value, fallback) => {
   const n = Number(value);
@@ -124,6 +124,17 @@ async function appendRound(alias, round) {
     return r;
   });
   return out;
+}
+// MEASURED failure mode: a round persisted as "running" stayed that way forever even though its
+// turn/end (aborted) was on disk, so the ledger contradicted the log. A later read that does see the
+// verdict writes it back.
+async function refreshOutcome(alias, requestId, state) {
+  if (!requestId || !state) return;
+  await withLedger((r) => {
+    const round = (r[alias]?.rounds || []).find((x) => x.requestId === requestId);
+    if (round && round.outcome !== state) { round.outcome = state; log({ ev: 'outcome-refreshed', alias, requestId, state }); }
+    return r;
+  });
 }
 function regGet(alias) {
   const s = readLedger()[alias];
@@ -235,22 +246,34 @@ async function sessionScope(sessionId) {
 
 // Reading asOfSeq first still races a live session, so "past cursor N" corrects the cursor instead
 // of failing the call. throughSeq must be <= asOfSeq.
-async function pageAfter(sessionId, sinceSeq, maxMessages = 20) {
-  let through = await asOf(sessionId);
-  if (!through) return { events: [], through: 0, hasMore: false, note: 'no readable log yet (asOfSeq=0)' };
+//
+// A round is paged from its OWN baseline, never from the tail: session/page returns the newest
+// maxMessages events at or below throughSeq, so a tail-anchored read of a long session silently drops
+// the round's turn/end - and an aborted round then reports state "idle", i.e. "nothing happened",
+// which is the exact false negative the state machine exists to prevent. 'tail' is only for "what is
+// this session doing right now" (adoption previews).
+async function pageWindow(sessionId, sinceSeq, maxMessages = 20, anchored = 'baseline') {
+  let asOfSeq = await asOf(sessionId);
+  if (!asOfSeq) return { events: [], window: { sinceSeq: sinceSeq || 0, throughSeq: 0, asOfSeq: 0, anchored, truncated: false },
+    note: 'no readable log yet (asOfSeq=0)' };
+  let w = calcWindow({ sinceSeq: sinceSeq || 0, asOfSeq, maxMessages, anchored });
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
-      const v = await call('session/page', ARGS.sessionPage({ sessionId, throughSeq: through, maxMessages }));
-      const events = (v?.records || []).map((r) => r.event || r).filter((e) => e && e.seq > sinceSeq);
-      return { events, through, hasMore: !!v?.hasMore };
+      const v = await call('session/page', ARGS.sessionPage({ sessionId, throughSeq: w.throughSeq, maxMessages }));
+      const events = (v?.records || []).map((r) => r.event || r).filter((e) => e && e.seq > w.sinceSeq);
+      return { events, window: { sinceSeq: w.sinceSeq, throughSeq: w.throughSeq, asOfSeq, anchored,
+        oldestSeq: events[0]?.seq ?? null, newestSeq: events[events.length - 1]?.seq ?? null,
+        truncated: !!v?.hasMore || asOfSeq > w.throughSeq } };
     } catch (e) {
       const corrected = pastCursor(e?.message);
-      if (corrected === null || corrected === through) throw e;
-      through = corrected;
+      if (corrected === null || corrected === w.throughSeq) throw e;
+      asOfSeq = corrected;
+      w = calcWindow({ sinceSeq: sinceSeq || 0, asOfSeq, maxMessages, anchored });
     }
   }
   throw new Error(`session/page never agreed with session/projections for ${sessionId}`);
 }
+const pageTail = (sessionId, maxMessages) => pageWindow(sessionId, 0, maxMessages, 'tail');
 
 // MEASURED: session/list.running is the only trustworthy "still working" flag. The list spans every
 // workspace, so it is cached for one poll interval and shared across aliases in the same tick.
@@ -265,13 +288,46 @@ async function liveRow(sessionId, maxAgeMs = CFG.pollMs) {
 }
 const dropListCache = () => { listCache = { at: 0, items: null }; };
 
-async function readRound(s) {
-  const { events, hasMore } = await pageAfter(s.sessionId, lastRound(s).sinceSeq ?? 0, 12).catch(() => ({ events: [], hasMore: false }));
+// A round can span hundreds of events (measured: 200+ between dispatch and its own turn/end), so one
+// fixed window is not enough: too small and the verdict is missed, too wide and the NEXT round's
+// turn/end is read as this round's. Widen until the round's own turn/end is inside the window, then
+// cut the events at it. MEASURED: session/page treats maxMessages as a hint, not a cap (asking for 12
+// returned 74 records), and 1000 returns a whole 1445-event log with hasMore=false.
+const WINDOW_BUDGETS = [24, 200, 1000];
+async function readRoundEvents(sessionId, sinceSeq, budgets = WINDOW_BUDGETS) {
+  let last = { events: [], window: { sinceSeq, truncated: true } };
+  for (const maxMessages of budgets) {
+    try { last = await pageWindow(sessionId, sinceSeq, maxMessages); } catch { break; }
+    if (last.events.some((e) => e.type === 'turn/end')) break;
+    if (!last.window?.truncated) break;                    // the log really ends here: nothing more to find
+  }
+  return { ...last, events: sliceRound(last.events) };
+}
+
+async function readRound(s, budgets = WINDOW_BUDGETS) {
+  const sinceSeq = lastRound(s).sinceSeq ?? 0;
+  const { events, window } = await readRoundEvents(s.sessionId, sinceSeq, budgets);
   const p = await projections(s.sessionId).catch(() => null);
   const row = await liveRow(s.sessionId);
-  return { ...interpret(events, row?.running ?? null), hasMore,
+  const r = interpret(events, row?.running ?? null);
+  // "I did not see the end of this round" must never be reported as "this round did not end".
+  const unseen = !r.settled && window?.truncated;
+  return { ...r, window, windowTruncated: !!window?.truncated, verdictComplete: r.settled || !unseen,
+    ...(unseen ? { note: `no turn/end inside seq ${window.sinceSeq}..${window.throughSeq} of ${window.asOfSeq}; state is not a verdict - widen the window (dsh_result messages:N)` } : {}),
     model: modelLabel(p?.modelSelection?.lastUsed || lastRound(s).pinned || s.pinned),
     tokenUsage: p?.tokenUsage || null, contextPressure: p?.contextPressure || null };
+}
+
+// A task that writes outside the session workspace is denied by dsh's sandbox, and the denial text
+// ("escalation available - retry with sandbox_permissions") cannot be honoured by an unattended
+// dispatch: nobody is at the UI to approve it, so the round just burns quota and aborts. Refusing up
+// front is cheaper than a warning nobody reads - which is exactly what happened on 2026-10-18.
+function assertInsideCwd(task, dir, allowOutsideCwd) {
+  const outside = pathsOutsideCwd(task, dir);
+  if (!outside.length || allowOutsideCwd) return outside;
+  const e = new Error(`task names ${outside.length} path(s) outside the session workspace ${dir}: ${outside.join(' , ')}. dsh's sandbox will deny writes there and an unattended dispatch cannot approve the escalation. Re-launch with cwd set to the directory the task actually changes; pass allowOutsideCwd:true only if the task merely reads them.`);
+  e.detail = { cwd: dir, outsideCwd: outside };
+  throw e;
 }
 
 // Resolved purely, before anything touches the network: a disallowed model must be refused without
@@ -329,7 +385,7 @@ async function resolveWorkspace(cwd) {
 }
 
 async function findBaseline(sessionId, preSeq, requestId) {
-  const { events } = await pageAfter(sessionId, preSeq, 40).catch(() => ({ events: [] }));
+  const { events } = await pageWindow(sessionId, preSeq, 40).catch(() => ({ events: [] }));
   return baselineFrom(preSeq, events, requestId);
 }
 
@@ -344,7 +400,9 @@ async function dispatchRound(sessionId, task, requestId, { watchMs = CFG.watchMs
   let r = { settled: false, state: 'running' };
   while (Date.now() - started < watchMs) {
     await sleep(CFG.pollMs);
-    const { events } = await pageAfter(sessionId, sinceSeq, 10).catch(() => ({ events: [] }));
+    // Widening but capped: polling pays for every event it pulls, and a long round still settles -
+    // the authoritative read happens in dsh_wait/dsh_result, which escalates further.
+    const { events } = await readRoundEvents(sessionId, sinceSeq, [24, 200]).catch(() => ({ events: [] }));
     r = interpret(events, (await liveRow(sessionId, 0))?.running ?? null);
     if (r.settled) return { ...head, ...r, elapsedMs: Date.now() - started };
     idlePolls = r.state === 'idle' ? idlePolls + 1 : 0;
@@ -365,12 +423,16 @@ const server = new McpServer({ name: 'dsh', version: '0.3.0' }, {
   instructions: 'dsh is a second agent harness. Dispatch is asynchronous: dsh_launch/dsh_send return a handle, then call dsh_wait (<=45s per call) or dsh_status until state is completed/error/idle, and dsh_result to audit. Never treat acceptance, or a running->idle flip, as success; trust "state". Models are policy-bound: read dsh_models and pass model/reasoningEffort only from it. Sidebar grouping is fixed at creation: dsh_launch lands a session in the project group for its cwd; dsh_adopt cannot change an existing session\'s group.',
 });
 
+// One registration path so the tool count in the serve log cannot drift from the tools that exist.
+const TOOL_NAMES = [];
+const tool = (name, def, handler) => { TOOL_NAMES.push(name); server.registerTool(name, def, handler); };
+
 const modelParams = {
   model: z.string().optional().describe('provider/model, only values permitted by DSH_ALLOWED_MODELS'),
   reasoningEffort: z.string().optional().describe('one of the efforts the chosen model advertises'),
 };
 
-server.registerTool('dsh_models', {
+tool('dsh_models', {
   description: 'List the models dsh can use right now (live catalog), narrowed by the DSH_ALLOWED_MODELS policy, with the default selection and any provider failures. Read this before choosing model/reasoningEffort. Makes no model call.',
   inputSchema: {},
 }, async () => {
@@ -391,7 +453,30 @@ server.registerTool('dsh_models', {
   } catch (e) { return fail(e); }
 });
 
-server.registerTool('dsh_launch', {
+tool('dsh_permissions', {
+  description: 'Read-only view of the sandbox/permission surface: the presets dsh offers, the instance default, and - for an alias - the session\'s effective mode plus its change history (who escalated it and when). Changing the mode is NOT possible over /api; do it in the dsh UI.',
+  inputSchema: { alias: z.string().optional().describe('include this session\'s effective mode and permission-event history') },
+}, async ({ alias }) => {
+  try {
+    log({ ev: 'tool', tool: 'dsh_permissions', alias: alias || null });
+    await ensureServer();
+    const cat = await call('permissionPresets/catalog', ARGS.permissionCatalog()).catch(() => null);
+    const out = { ok: true, presets: (cat?.options || []).map((o) => o.value), defaultPreset: cat?.defaultPreset || null,
+      settableOverApi: false,
+      note: 'permissionPresets/set, permissionPresets/current and session/setSandboxMode are not forwarded by the gateway (404). The only programmatic switch is the in-session /permission command, which this bridge deliberately does not call: raising a sandbox is a human decision.' };
+    if (alias) {
+      const s = regGet(alias);
+      const p = await projections(s.sessionId).catch(() => null);
+      const { events } = await pageWindow(s.sessionId, -1, 1000).catch(() => ({ events: [] }));
+      out.session = { alias, sessionId: s.sessionId, effective: p?.permissions?.currentValue || null,
+        agentPreset: p?.agentPreset || null, workingDirectory: p?.workingDirectory || null,
+        ...permissionHistory(events) };
+    }
+    return json(out);
+  } catch (e) { return fail(e); }
+});
+
+tool('dsh_launch', {
   description: 'Create a named dsh session bound to a workspace (landed in that path\'s sidebar group), pin its model, and dispatch the first task list. Returns a handle when the round settles or the watch window ends.',
   inputSchema: {
     alias: z.string().describe('caller-chosen name, e.g. p1-recon; becomes the session id "dsh-<alias>"'),
@@ -400,14 +485,17 @@ server.registerTool('dsh_launch', {
     phase: z.string().optional(),
     group: z.boolean().optional().describe('default true: put the session in the sidebar group for this path; false leaves it Ungrouped'),
     dryRun: z.boolean().optional().describe('create + group + pin, dispatch nothing (spends no quota)'),
+    allowOutsideCwd: z.boolean().optional().describe('the task names paths outside cwd on purpose (read-only use); without it such a dispatch is refused, because dsh will deny the writes and nobody can approve the escalation'),
     ...modelParams,
   },
-}, async ({ alias, cwd, task, phase, model, reasoningEffort, group, dryRun }) => {
+}, async ({ alias, cwd, task, phase, model, reasoningEffort, group, dryRun, allowOutsideCwd }) => {
   try {
     log({ ev: 'tool', tool: 'dsh_launch', alias, cwd });
     checkAlias(alias);
     const dir = checkCwd(cwd);
     const want = assertModelAllowed(model, reasoningEffort);
+    const outside = assertInsideCwd(task, dir, allowOutsideCwd);
+    if (outside.length) log({ ev: 'cwd-advisory', alias, outside, allowed: true });
     const sessionId = `dsh-${alias}`;
     const existing = readLedger()[alias];
     if (existing && normCwd(existing.cwd) !== normCwd(dir)) {
@@ -423,12 +511,10 @@ server.registerTool('dsh_launch', {
       workspaceId: ws?.workspaceId || null, workspaceTitle: ws?.title || null, adopted: false,
       created: existing?.created || new Date().toISOString(), rounds: existing?.rounds || [] });
     const pinned = await pinModel(sessionId, want);
-    const outside = pathsOutsideCwd(task, dir);
-    if (outside.length) log({ ev: 'cwd-advisory', alias, outside });
     if (dryRun) {
       return json({ ok: true, alias, sessionId, cwd: dir, grouped: !!ws, workspaceId: ws?.workspaceId || null,
         workspaceTitle: ws?.title || null, pinned, dispatched: false,
-        warnings: outside.length ? [`task names ${outside.length} path(s) outside the session workspace ${dir}; dsh's sandbox will deny writes there`] : [],
+        warnings: outside.length ? [`dispatched anyway because allowOutsideCwd:true - dsh's sandbox will deny writes to ${outside.join(' , ')}`] : [],
         outsideCwd: outside, scope: await sessionScope(sessionId),
         note: 'dry run: session created and grouped, nothing dispatched' });
     }
@@ -437,33 +523,35 @@ server.registerTool('dsh_launch', {
     await appendRound(alias, { ...roundRecord(res, pinned), task });
     return json({ ok: true, alias, sessionId, cwd: dir, grouped: !!ws, workspaceTitle: ws?.title || null,
       round: entry.rounds.length + 1, pinned, scope,
-      warnings: outside.length ? [`task names ${outside.length} path(s) outside the session workspace ${dir}: ${outside.join(' , ')} - expect sandbox denials unless the task only reads them`] : [],
+      warnings: outside.length ? [`allowOutsideCwd:true - writes to ${outside.join(' , ')} will be denied by the sandbox`] : [],
       outsideCwd: outside, ...res });
   } catch (e) { return fail(e); }
 });
 
-server.registerTool('dsh_send', {
+tool('dsh_send', {
   description: 'Dispatch the next task list into an existing alias (a new round of the same conversation). Re-pins only if you pass model/reasoningEffort.',
-  inputSchema: { alias: z.string(), task: z.string(), ...modelParams },
-}, async ({ alias, task, model, reasoningEffort }) => {
+  inputSchema: { alias: z.string(), task: z.string(),
+    allowOutsideCwd: z.boolean().optional().describe('the task names paths outside the session workspace on purpose (read-only use)'),
+    ...modelParams },
+}, async ({ alias, task, model, reasoningEffort, allowOutsideCwd }) => {
   try {
     log({ ev: 'tool', tool: 'dsh_send', alias });
     const s = regGet(alias);
     const want = assertModelAllowed(model, reasoningEffort);
+    const outside = assertInsideCwd(task, s.cwd, allowOutsideCwd);
+    if (outside.length) log({ ev: 'cwd-advisory', alias, outside, allowed: true });
     await ensureServer();
     const pinned = await pinModel(s.sessionId, want) || lastRound(s).pinned || s.pinned || null;
-    const outside = pathsOutsideCwd(task, s.cwd);
-    if (outside.length) log({ ev: 'cwd-advisory', alias, outside });
     const scope = await sessionScope(s.sessionId);
     const res = await dispatchRound(s.sessionId, task, `${alias}-r${(s.rounds || []).length + 1}-${Date.now().toString(36)}`);
     const rounds = await appendRound(alias, { ...roundRecord(res, pinned), task });
     return json({ ok: true, alias, sessionId: s.sessionId, round: rounds.length, pinned, scope,
-      warnings: outside.length ? [`task names ${outside.length} path(s) outside the session workspace ${s.cwd}: ${outside.join(' , ')} - expect sandbox denials unless the task only reads them`] : [],
+      warnings: outside.length ? [`allowOutsideCwd:true - writes to ${outside.join(' , ')} will be denied by the sandbox (session workspace is ${s.cwd})`] : [],
       outsideCwd: outside, ...res });
   } catch (e) { return fail(e); }
 });
 
-server.registerTool('dsh_adopt', {
+tool('dsh_adopt', {
   description: 'Take over an ALREADY-EXISTING dsh session (e.g. one started in the web UI) under an alias, so later rounds and audits address it by name. Find ids with dsh_sessions {cwd}. Nothing is dispatched.',
   inputSchema: {
     alias: z.string(),
@@ -490,7 +578,7 @@ server.registerTool('dsh_adopt', {
     const entry = await upsertAlias(alias, { sessionId: effectiveId, cwd: dir, phase: phase || existing?.phase || null,
       adopted: true, pinned, created: existing?.created || new Date().toISOString(), rounds: existing?.rounds || [] });
     dropListCache();
-    const { events } = await pageAfter(effectiveId, 0, 6).catch(() => ({ events: [] }));
+    const { events } = await pageTail(effectiveId, 8).catch(() => ({ events: [] }));   // adoption previews the tail, not the round
     return json({ ok: true, alias, requestedSessionId: sessionId, sessionId: effectiveId,
       agentPreset: v?.agentPreset || null, reused: effectiveId === sessionId, cwd: dir, pinned,
       sidebarGroup: 'not settable after creation; the adopted session keeps whatever group dsh put it in',
@@ -499,7 +587,7 @@ server.registerTool('dsh_adopt', {
   } catch (e) { return fail(e); }
 });
 
-server.registerTool('dsh_wait', {
+tool('dsh_wait', {
   description: 'Watch the current round until it settles or maxSeconds elapses. Keep maxSeconds <= 45 to stay under the MCP tool timeout; call again if it returns state "running".',
   inputSchema: { alias: z.string(), maxSeconds: z.number().int().min(1).max(45).default(40) },
 }, async ({ alias, maxSeconds }) => {
@@ -518,7 +606,7 @@ server.registerTool('dsh_wait', {
   } catch (e) { return fail(e); }
 });
 
-server.registerTool('dsh_status', {
+tool('dsh_status', {
   description: 'Immediate snapshot: current round state, model actually used, token usage, context pressure, pending plan, open user questions.',
   inputSchema: { alias: z.string() },
 }, async ({ alias }) => {
@@ -537,28 +625,36 @@ server.registerTool('dsh_status', {
   } catch (e) { return fail(e); }
 });
 
-server.registerTool('dsh_result', {
-  description: 'Audit payload for the current round: assistant texts, the tool calls that produced them, files touched, turn outline.',
-  inputSchema: { alias: z.string(), messages: z.number().int().min(1).max(40).default(14) },
-}, async ({ alias, messages }) => {
+tool('dsh_result', {
+  description: 'Audit payload for one round: assistant texts, the tool calls that produced them, failed tool bodies, files touched, turn outline. Reads that round from its own baseline and widens the window until the round\'s turn/end is inside it, so a settled round is never reported as idle and a later round is never mistaken for this one.',
+  inputSchema: { alias: z.string(), messages: z.number().int().min(1).max(40).default(14),
+    round: z.number().int().min(1).optional().describe('audit an earlier round instead of the latest') },
+}, async ({ alias, messages, round }) => {
   try {
-    log({ ev: 'tool', tool: 'dsh_result', alias });
+    log({ ev: 'tool', tool: 'dsh_result', alias, round: round || null });
     const s = regGet(alias);                             // a wrong alias is refused without waking dsh
     await ensureServer();
-    const { events, hasMore } = await pageAfter(s.sessionId, lastRound(s).sinceSeq ?? 0, messages);
+    const rounds = s.rounds || [];
+    const target = round ? rounds[round - 1] : rounds[rounds.length - 1];
+    if (!target) return fail(new Error(`alias "${alias}" has no rounds yet${round ? ` (asked for round ${round})` : ''}`));
+    const { events, window } = await readRoundEvents(s.sessionId, target.sinceSeq ?? 0, [messages, ...WINDOW_BUDGETS]);
     const p = await projections(s.sessionId).catch(() => null);
-    return json({ ok: true, alias, round: (s.rounds || []).length, requestId: lastRound(s).requestId || null,
-      correlated: lastRound(s).correlated ?? null, hasMore,
-      model: modelLabel(p?.modelSelection?.lastUsed || lastRound(s).pinned || s.pinned),
-      tokenUsage: p?.tokenUsage || null,
-      ...interpret(events, (await liveRow(s.sessionId))?.running ?? null),
+    const r = interpret(events, (await liveRow(s.sessionId))?.running ?? null);
+    const unseen = !r.settled && window?.truncated;
+    if (r.settled && target.outcome !== r.state) await refreshOutcome(alias, target.requestId, r.state);
+    return json({ ok: true, alias, round: round || rounds.length, requestId: target.requestId || null,
+      correlated: target.correlated ?? null, window, windowTruncated: !!window?.truncated,
+      verdictComplete: r.settled || !unseen,
+      ...(unseen ? { note: `no turn/end inside seq ${window.sinceSeq}..${window.throughSeq} of ${window.asOfSeq}; state is not a verdict` } : {}),
+      model: modelLabel(p?.modelSelection?.lastUsed || target.pinned || s.pinned),
+      tokenUsage: p?.tokenUsage || null, ...r,
       assistantTexts: events.filter((e) => e.type === 'assistant/message')
         .map((a) => ({ turn: a.data?.turn, text: (a.data?.message?.content || []).filter((c) => c.type === 'text').map((c) => c.text).join('').slice(0, 1200) })),
-      turnOutline: (p?.turnOutline || []).slice(-6), task: lastRound(s).task || null });
+      turnOutline: (p?.turnOutline || []).slice(-6), task: target.task || null });
   } catch (e) { return fail(e); }
 });
 
-server.registerTool('dsh_sessions', {
+tool('dsh_sessions', {
   description: 'List aliases this bridge owns. Live dsh sessions are only returned when a cwd is given: the unfiltered list spans every workspace (90+ here) and must not be inlined.',
   inputSchema: { cwd: z.string().optional() },
 }, async ({ cwd }) => {
@@ -578,7 +674,7 @@ server.registerTool('dsh_sessions', {
   } catch (e) { return fail(e); }
 });
 
-server.registerTool('dsh_cancel', {
+tool('dsh_cancel', {
   description: 'Ask dsh to cancel the in-flight round of an alias. Accepted asynchronously: confirm with dsh_wait, which should then report a settled or idle round.',
   inputSchema: { alias: z.string() },
 }, async ({ alias }) => {
@@ -594,6 +690,6 @@ server.registerTool('dsh_cancel', {
 });
 
 await server.connect(new StdioServerTransport());
-log({ ev: 'serve', tools: 9, host: CFG.host, port: CFG.port, mode: CFG.attachOutfile ? 'attach' : 'spawn-on-demand',
+log({ ev: 'serve', tools: TOOL_NAMES.length, toolNames: TOOL_NAMES, host: CFG.host, port: CFG.port, mode: CFG.attachOutfile ? 'attach' : 'spawn-on-demand',
   stateDir: STATE_DIR, policy: ALLOW ? allowedText(ALLOW) : '(unrestricted)',
   defaultModel: CFG.defaultModel || null, defaultEffort: CFG.defaultEffort || null, watchMs: CFG.watchMs });

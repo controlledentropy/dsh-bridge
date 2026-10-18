@@ -218,6 +218,17 @@ export async function doctor() {
   out.tokenCapturedNote = out.tokenCaptured
     ? (out.listening ? 'read from the live capture file' : 'STALE: nothing is listening, so this token belongs to a dead process - unusable')
     : 'none captured yet';
+  // Whatever environment the MCP client hands this bridge is what dsh's own pwsh/run_code children
+  // inherit. A PATHEXT without .EXE makes PowerShell launch nothing and report nothing - no output, no
+  // exit code, no error - which reads exactly like "the tool is not installed".
+  out.env = { pathext: process.env.PATHEXT || null, temp: process.env.TEMP || process.env.TMP || null };
+  out.env.problems = [];
+  if (process.platform === 'win32') {
+    if (!/\.EXE/i.test(out.env.pathext || '')) {
+      out.env.problems.push(`PATHEXT="${out.env.pathext}" lacks .EXE: child processes started from this environment can fail silently (PowerShell finds the exe, launches nothing, reports no error). Compare with the registry value at HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment.`);
+    }
+    if (!out.env.temp) out.env.problems.push('neither TEMP nor TMP is set: tools that resolve a temp dir will build a relative path and fail with ENOENT');
+  }
   if (st.listening && out.tokenCaptured) {
     try {
       const r = await fetch(`http://${HOST}:${PORT}/connect?token=${currentToken()}&interactions=answer`, { redirect: 'manual', signal: AbortSignal.timeout(8000) });
@@ -241,6 +252,7 @@ export async function doctor() {
   if (out.api?.authed) steps.push('token -> cookie');
   if (out.catalog?.ok) steps.push('/api answers (modelCatalog)');
   out.summary = steps.join('  ->  ');
+  out.problems = [...c.problems, ...out.env.problems.map((p) => 'host env: ' + p)];
   out.broken = !out.api?.authed
     ? (out.listening ? 'token not readable: restart via start-dsh-web.ps1 so stdout is captured' : 'no instance listening: run start-dsh-web.ps1, or let the bridge self-start it')
     : (out.catalog?.ok ? null : '/api did not answer modelCatalog - suspect dsh version drift, check docs/API-CONTRACT.md');

@@ -2,7 +2,7 @@
 
 **通过 MCP，让 Codex、Claude Desktop、Cursor 等客户端调用本机的 DeepSeek Harness（`dsh web`）。**
 
-`dsh-bridge` 是一个基于 **stdio** 的 MCP Server。它将 [`@deepseek-ai/dsh`](https://www.npmjs.com/package/@deepseek-ai/dsh) 的本机 `/api` 封装为 **9 个 MCP 工具**，让 AI 客户端能够创建或接管会话、派发任务、等待执行、查看结果，并保留可审计的任务记录。
+`dsh-bridge` 是一个基于 **stdio** 的 MCP Server。它将 [`@deepseek-ai/dsh`](https://www.npmjs.com/package/@deepseek-ai/dsh) 的本机 `/api` 封装为 **10 个 MCP 工具**，让 AI 客户端能够创建或接管会话、派发任务、等待执行、查看结果，并保留可审计的任务记录。
 
 无需修改 `dsh`，也无需在 Codex 中安装专用插件。
 
@@ -190,21 +190,26 @@ dsh_status {alias}                 查看模型、token 用量和上下文压力
 
 一轮里出现工具错误时，`dsh_result` / `dsh_status` 会给出 `toolErrorCount`（数量）、`toolErrors[]`（每条含 `seq / turn / step / name / code / body`，正文截断到 400 字符）与 `sandboxDenials`（其中属于沙箱拒绝的条数）。`tool/result` 事件本身**不带工具名**，桥接按 `(turn, step)` 回连到对应的 `tool/call`，所以 `toolErrors[].name` 能直接告诉你是 `run_code` 还是 `Write` 失败。
 
-沙箱拒绝**不会**在服务端排队等待审批：它以 `isError` 的工具结果返回，dsh 把"可以提权重试"的提示写在正文里。因此 `sandboxDenials > 0` 的含义是"任务的写入范围超出了会话工作区"，而不是"等用户点确认"。
+沙箱拒绝**不会**在服务端排队等待审批：它以 `isError` 的工具结果返回，dsh 把"可以提权重试"的提示写在正文里——但在无人值守的派单场景里没有人能点这个确认，那句提示等于不会兑现。因此 `sandboxDenials > 0` 的含义是"任务的写入范围超出了会话工作区"，正确处置是换 `cwd` 重开会话，而不是等待或重试。判定只认 `file access denied` / `escalation available` / `EPERM`：dsh 会给各种失败结果都追加 `File sandbox: <mode>.` 脚注，拿它当判据会把普通报错也算成拒绝（实测 8 条错误里只有 1 条是真拒绝）。
 
-会话的写入边界就是它的 `cwd`。`dsh_launch` / `dsh_send` 的返回里带 `scope`（`workingDirectory` / `sandbox` / `agentPreset` / `model`）、`warnings` 与 `outsideCwd`（任务文本里出现的工作区外绝对路径，最多 8 条）。**会话建在哪个目录，就由那个目录决定它能写哪里**：任务要改动别的仓库时，应以那个仓库作为 `cwd` 建会话（侧边栏分栏跟随 `cwd`），而不是在 A 工作区的会话里写 B 目录。
+会话的写入边界就是它的 `cwd`。**任务文本里出现工作区之外的绝对路径时，`dsh_launch` / `dsh_send` 直接拒绝下发**（错误里列出这些路径），因为那一轮注定被沙箱拒绝、只会白烧额度；确属只读引用时传 `allowOutsideCwd: true` 放行，返回里会带 `warnings` 与 `outsideCwd`。任务要改动别的仓库时，以那个仓库作为 `cwd` 建会话（侧边栏分栏跟随 `cwd`），不要在 A 工作区的会话里写 B 目录。
+
+一轮可能横跨数百条事件，所以判决读取是**从本轮 baseline 起、逐级加宽窗口（24 → 200 → 1000）直到本轮自己的 `turn/end` 落进窗口，再截断到该事件**：既不会把下一轮的 `completed` 当成本轮结论，也不会因为窗口太小把已中止的一轮读成"什么都没发生"。返回里的 `windowTruncated` 表示窗口没覆盖到日志末尾，`verdictComplete` 表示本轮判决确实在窗口内——两者要一起看。中止还会带 `abortReason`（实测 `user` 表示是人中止的，不是 dsh 自己放弃）。
+
+沙箱档位与提权痕迹用 `dsh_permissions` 只读查看：生效档位、`escalated`、`escalatedBy`、审批策略变化（实测一次人工提权会同时把 `approval/policy` 从 `ask` 改成 `never`）。**提权前后的两轮环境前提不同，不能互相取证。**
 
 ## MCP 工具一览
 
 | 工具 | 主要参数 | 作用 |
 | --- | --- | --- |
 | `dsh_models` | 无 | 返回实时模型目录与允许清单的交集，包含默认模型、可路由 provider 和加载失败信息 |
-| `dsh_launch` | `alias`, `cwd`, `task`; 可选 `phase`, `group`, `dryRun`, `model`, `reasoningEffort` | 新建命名会话、设置模型并提交第一轮；`dryRun` 只创建会话，不执行任务 |
-| `dsh_send` | `alias`, `task`; 可选 `model`, `reasoningEffort` | 向同一会话提交下一轮 |
+| `dsh_permissions` | 可选 `alias` | **只读**查看沙箱面：dsh 提供的档位（`read-only` / `workspace-write` / `danger-full-access`）、实例默认档位；给了 `alias` 还会返回该会话的生效档位与变更史（`escalated`、`escalatedBy`、`approvals`）。**改档位不在这里**：`/api` 上没有 per-session 写入口，只能在 dsh UI 里由人操作 |
+| `dsh_launch` | `alias`, `cwd`, `task`; 可选 `phase`, `group`, `dryRun`, `allowOutsideCwd`, `model`, `reasoningEffort` | 新建命名会话、设置模型并提交第一轮；`dryRun` 只创建会话，不执行任务 |
+| `dsh_send` | `alias`, `task`; 可选 `allowOutsideCwd`, `model`, `reasoningEffort` | 向同一会话提交下一轮 |
 | `dsh_adopt` | `alias`, `sessionId`, `cwd`; 可选 `phase` 等 | 接管已存在的 `dsh web` 会话，不改变其分栏 |
 | `dsh_wait` | `alias`; 可选 `maxSeconds`（≤ 45） | 在限定时间内等待本轮完成或返回当前状态 |
 | `dsh_status` | `alias` | 返回本轮状态、模型、token 用量、上下文压力、待答问题，以及会话边界信息：`workingDirectory`、`sandbox`（如 `workspace-write`）、`agentPreset`、`sessionStats` |
-| `dsh_result` | `alias`; 可选 `messages`（≤ 40） | 获取本轮验收载荷：助手文本、工具调用、落盘文件、`toolErrors[]`（含失败正文与错误码）、`sandboxDenials`；默认只读取本轮 |
+| `dsh_result` | `alias`; 可选 `messages`（≤ 40）、`round` | 获取某一轮（默认最新一轮）的验收载荷：助手文本、工具调用、落盘文件、`toolErrors[]`（含失败正文与错误码）、`sandboxDenials`、`window` / `windowTruncated` / `verdictComplete` |
 | `dsh_sessions` | 可选 `cwd` | 查看桥接持有的别名；传入 `cwd` 时额外查询该工作区的活会话 |
 | `dsh_cancel` | `alias` | 请求取消当前轮；需再次检查最终状态 |
 
@@ -359,6 +364,10 @@ GitHub Actions 工作流配置在 Linux / Windows、Node.js 20 / 22 上运行离
 | 会话未出现在预期侧边栏 | 创建时未关联正确 workspace | 新建会话并启用自动分栏；已接管会话无法通过桥接改组 |
 | MCP 客户端面板未显示工具 | 某些客户端不会展示完整工具列表 | 尝试直接调用 `dsh_models`，查看 `bridge.log.jsonl` 中的 `ev:"tool"` |
 | 返回 `idle` 或 `accepted: true` | 还没有可确认的完成记录 | 继续查询状态；绝不据此宣称任务完成 |
+| `sandboxDenials > 0`、正文出现 `file access denied` / `EPERM` | 任务要写的目录在会话工作区之外 | 以目标目录为 `cwd` 重开会话；不要指望"提权重试"提示，无人值守时没人能批准 |
+| `run_code` 报 `ENOENT …\undefined\temp\…` 或写 `%TEMP%` 报 `EPERM` | dsh 的 `run_code` 会清空进程环境，`os.tmpdir()` 因此拼出相对路径；写真实 TEMP 又被沙箱拒绝 | 任务包里显式规定临时文件写在会话工作区内的绝对路径 |
+| 子进程"没有输出也没有退出码"（例如 git 明明装了） | 宿主环境 `PATHEXT` 不含 `.EXE`（打包应用的子进程环境可能不是注册表那份），PowerShell 会静默不启动 | `node launch.mjs doctor` 的 `env.problems` 会直接报出来；对比注册表 `Session Manager\Environment` 的值 |
+| dsh 设置里 Agent presets 只剩两个 | `ptc` / `minimal` 需要 Developer tools 偏好开启，而该偏好被 profile 补丁写成了 `enabled: false` | 与桥接无关：`agentPresets/list` 仍返回全部档位；在 dsh 设置里打开 Developer tools，或删掉 `profiles/<p>/cordis.patch.yml` 里的 `ui-settings` 覆盖 |
 
 ## 安全与使用边界
 

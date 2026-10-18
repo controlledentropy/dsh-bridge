@@ -15,7 +15,7 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 
 const PKG = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const TOOLS = ['dsh_models', 'dsh_launch', 'dsh_send', 'dsh_adopt', 'dsh_wait', 'dsh_status', 'dsh_result', 'dsh_sessions', 'dsh_cancel'];
+const TOOLS = ['dsh_models', 'dsh_permissions', 'dsh_launch', 'dsh_send', 'dsh_adopt', 'dsh_wait', 'dsh_status', 'dsh_result', 'dsh_sessions', 'dsh_cancel'];
 
 // A Codex-shaped minimal environment: only what the bridge actually needs, in a throwaway state dir.
 function bridgeEnv(stateDir, extra) {
@@ -29,8 +29,10 @@ function bridgeEnv(stateDir, extra) {
 function workspace() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-bridge-test-'));
   const cwd = path.join(dir, 'ws');
+  const sibling = path.join(dir, 'other-repo');
   fs.mkdirSync(cwd);                                   // checkCwd requires a real directory
-  return { dir, state: path.join(dir, 'state'), cwd, missing: path.join(cwd, 'not-created'), cleanup: () => fs.rmSync(dir, { recursive: true, force: true }) };
+  fs.mkdirSync(sibling);                               // a real directory outside the session workspace
+  return { dir, state: path.join(dir, 'state'), cwd, sibling, missing: path.join(cwd, 'not-created'), cleanup: () => fs.rmSync(dir, { recursive: true, force: true }) };
 }
 
 async function withBridge(env, fn) {
@@ -61,7 +63,7 @@ test('handshake, instructions and the full tool surface', async (t) => {
       }
       const launch = tools.find((x) => x.name === 'dsh_launch');
       assert.deepEqual(Object.keys(launch.inputSchema.properties).sort(),
-        ['alias', 'cwd', 'dryRun', 'group', 'model', 'phase', 'reasoningEffort', 'task'].sort(),
+        ['alias', 'allowOutsideCwd', 'cwd', 'dryRun', 'group', 'model', 'phase', 'reasoningEffort', 'task'].sort(),
         'dsh_launch keeps every declared parameter');
       assert.ok((launch.inputSchema.required || []).includes('alias'));
       assert.match(client.getInstructions(), /trust "state"/, 'instructions state that acceptance is not completion');
@@ -84,6 +86,9 @@ test('every pre-flight refusal happens before dsh is touched', async () => {
         ['dsh_launch', { alias: 'ok', cwd: ws.cwd, task: 'x', model: 'deepseek-account/deepseek-v4-pro' }, /not permitted by DSH_ALLOWED_MODELS/],
         ['dsh_launch', { alias: 'ok', cwd: ws.cwd, task: 'x', model: 'deepseek-account/deepseek-flash', reasoningEffort: 'max' }, /effort "max"/],
         ['dsh_launch', { alias: 'ok', cwd: ws.cwd, task: 'x', model: 'no-slash' }, /provider\/model/],
+        // The 2026-10-18 incident: a task aimed at another repository, dispatched into a session bound
+        // to a different workspace, is denied by dsh's sandbox and burns a whole round. Refuse it here.
+        ['dsh_launch', { alias: 'ok', cwd: ws.cwd, task: `在 ${ws.sibling} 里实现并跑测试` }, /outside the session workspace/],
         ['dsh_send', { alias: 'never-created', task: 'x' }, /unknown alias/],
         ['dsh_adopt', { alias: 'ok', sessionId: 's', cwd: ws.cwd, model: 'deepseek-account/deepseek-v4-pro' }, /not permitted/],
         ['dsh_adopt', { alias: 'bad alias!', sessionId: 's', cwd: ws.cwd }, /must match/],
