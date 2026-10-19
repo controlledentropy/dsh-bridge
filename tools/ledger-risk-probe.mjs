@@ -1,6 +1,6 @@
 #!/usr/bin/env node
-// Re-runnable evidence for one claim in AUDIT-2026-10-19: a ledger write failure must never cost the
-// caller either its handle or an answer it already read.
+// Re-runnable evidence for one property of the ledger: a write failure must never cost the caller either
+// its round handle or an answer it already read.
 //
 // It sabotages a COPY of a state directory, then asks a real bridge (any tree's bridge.mjs) for
 // `dsh_result` on a round that is settled in dsh's log but marked stale in the copy. The old code caught

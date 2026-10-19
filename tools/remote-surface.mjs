@@ -52,9 +52,9 @@ const body = `# dsh 的可转发方法表（生成物，勿手改）
 由 \`node tools/remote-surface.mjs\` 从本机安装的 dsh 包生成。它记录的是**网关会转发的方法全集**，
 与桥接实际用到的子集（文末）。升级 dsh 后请重跑本工具，并用 \`node launch.mjs check\` 看漂移。
 
-- 来源包：\`${r.pkgDir}\`
+- 来源包：npm 全局目录下的 \`@deepseek-ai/dsh\`（本机具体位置随安装而变，故只记版本）
 - dsh 版本：\`${r.version}\`
-- 方法表文件：\`${path.relative(PKG, tableFile)}\`
+- 方法表文件（相对包根）：\`node_modules/@deepseek-ai/dsh-api-remotes/lib/client.js\`
 - 方法数：**${methods.length}**
 - 名称摘要（只哈希方法名，不哈希描述）：\`${digest}\`
 

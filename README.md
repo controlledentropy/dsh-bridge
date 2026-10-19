@@ -419,12 +419,8 @@ GitHub Actions 工作流配置在 Linux / Windows、Node.js 20 / 22 上运行离
 | `lib/api-contract.mjs` | `/api` 请求与响应的适配 |
 | `lib/remote-surface.mjs` | 解析 dsh 随包的 RPC 方法表（纯函数，可用 fixture 离线测） |
 | `docs/REMOTE-SURFACE.md` | **生成物**：本机 dsh 会转发哪些方法，及其官方描述与名称摘要 |
-| `tools/ledger-risk-probe.mjs` | **可重跑的取证工具**（仅 Windows，需活实例）：复制状态目录并对副本注入"账本写不进"，验证派发/审计调用仍带回句柄、且不毁掉已读到的判决。不派发任何轮次，不消耗额度 |
+| `tools/ledger-risk-probe.mjs` | **可重跑的取证工具**（仅 Windows，需活实例）：复制状态目录并对副本注入"账本写不进"，验证派发与读取两侧都仍带回轮次句柄、且读到的判决不被记账失败毁掉。不派发任何轮次，不消耗额度 |
 | `tests/contract.test.mjs` | 离线契约回归测试 |
-
-审计记录按日期存放。外部审计的原文（`AUDIT-2026-10-19.md`）含有本机绝对路径与实例细节，**没有**随仓库公开，需要可向维护方索取；本项目的裁决与复现结果随仓库提交：
-
-- [`AUDIT-RESPONSE-2026-10-19.md`](AUDIT-RESPONSE-2026-10-19.md) — 对 `275b7c1..fa9ba3d` 那份外部审计的 7 条断言逐条独立裁决（成立/未证实）、活体前后对比、以及审计没抓到的一个盲区（未加引号且尚不存在的路径原先完全不进 cwd 守卫）。文中引用的复现输出与 `tools/ledger-risk-probe.mjs` 可重跑。
 
 升级建议：
 

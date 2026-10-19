@@ -26,6 +26,10 @@ run/
 *.ndjson
 *.har
 
+# Audit narrative stays local: it names the machine, the instance and the specific ways to make the
+# bridge misreport a round. The code fixes and their regression tests are what ships.
+AUDIT*.md
+
 *.log
 .DS_Store
 Thumbs.db
