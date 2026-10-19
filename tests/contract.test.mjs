@@ -11,7 +11,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { ARGS, envelope, authCookie, pastCursor, parseAllowlist, allowedText, checkPolicy, splitModel,
   modelLabel, ALIAS_RE, checkAlias, checkCwd, normCwd, roundRecord, baselineFrom, interpret, argText,
-  unwrapProjections, pathsOutsideCwd, pageWindow, sliceRound, permissionHistory, approvalState,
+  unwrapProjections, pathsOutsideCwd, pathFlavor, pageWindow, sliceRound, permissionHistory, approvalState,
   walkRound, verdictFields, humanWaits, modelEfforts, pickVerdict, capTexts, inFlightRound } from '../lib/api-contract.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -236,6 +236,32 @@ test('pathsOutsideCwd blocks writes outside the workspace and only those', () =>
     assert.deepEqual(tiers(`把 ${TARGET}\\a.md 的结论抄到 ${path.join(root, 'other', 'b.md')}，${TARGET} 只读`, WS).read,
       [TARGET], 'the annotation demotes the path it follows');
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+// The gap this closes was documented as "未做的功能": the guard only recognised drive-letter paths, so on
+// Linux/macOS a brief that writes outside the session refused nothing and the sandbox denied it a round
+// later. These cases are pure - the existence probe is injected, so they run on any host.
+test('pathsOutsideCwd understands posix absolute paths, not just drive letters', () => {
+  const WS = '/home/me/ws';
+  const nothingExists = () => false;
+  const t = (task, cwd = WS) => pathsOutsideCwd(task, cwd, { exists: nothingExists });
+  assert.equal(pathFlavor('/etc/x'), 'posix');
+  assert.equal(pathFlavor('D:\\x'), 'win', 'a drive path is not a posix path');
+  assert.equal(pathFlavor('relative/x'), '');
+
+  assert.deepEqual(t('把结论写入 /etc/dsh/report.md').write, ['/etc/dsh/report.md'], 'a Chinese brief naming a posix write target is refused');
+  assert.deepEqual(t('write the summary to /srv/out/report.md').write, ['/srv/out/report.md']);
+  assert.deepEqual(t('把结论写入 "/srv/out/report.md"').all, ['/srv/out/report.md'], 'quoted works too');
+  assert.deepEqual(t('edit /home/me/ws/report.md'), { all: [], write: [], read: [] }, 'inside the workspace is never listed');
+  assert.deepEqual(t('write /home/me/ws-other/x.md').write, ['/home/me/ws-other/x.md'], 'a sibling directory sharing a prefix is outside');
+  assert.deepEqual(t('任务正文：/srv/tickets/02f.md（只读引用）').read, ['/srv/tickets/02f.md'], 'the read-only tier still applies');
+  assert.deepEqual(t('see https://www.unicode.org/reports/ for details'), { all: [], write: [], read: [] }, 'a URL is still not a path');
+  assert.deepEqual(t('no paths at all, 全是中文').all, []);
+  // A Windows brief handed to a posix session names nothing this guard can act on, and vice versa.
+  assert.deepEqual(t('write D:\\tmp\\a.md'), { all: [], write: [], read: [] }, 'the other flavour is not scanned');
+  assert.deepEqual(pathsOutsideCwd('把结论写入 /etc/x.md', 'D:\\work').all, [], 'a posix path under a Windows cwd is not a target');
+  // The root cwd is the one case where "everything is inside it" is true.
+  assert.deepEqual(t('/tmp/x.md', '/'), { all: [], write: [], read: [] }, 'nothing is outside /');
 });
 
 test('verdictFields never claims a verdict the round has not produced', () => {
