@@ -239,24 +239,41 @@ test('pathsOutsideCwd blocks writes outside the workspace and only those', () =>
 });
 
 test('verdictFields never claims a verdict the round has not produced', () => {
-  const running = { settled: false, state: 'running' };
-  const window = { sinceSeq: 4, newestSeq: 28, asOfSeq: 1084, truncated: true, reachedLogEnd: false };
+  const running = { settled: false, state: 'running', turnStarted: true };
+  const window = { sinceSeq: 4, newestSeq: 28, asOfSeq: 1084, truncated: true };
   // The reported defect: a still-running round whose log happened to be fully read must not report
   // verdictComplete:true just because nothing was truncated.
-  const fully = { sinceSeq: 4, newestSeq: 28, asOfSeq: 28, truncated: false, reachedLogEnd: true };
-  assert.deepEqual(verdictFields(running, window), { windowTruncated: true, verdictComplete: false, logExhausted: false,
+  const fully = { sinceSeq: 4, newestSeq: 28, asOfSeq: 28, truncated: false };
+  assert.deepEqual(verdictFields(running, window), { windowTruncated: true, verdictComplete: false, turnStarted: true,
     note: 'no turn/end within seq 4..28 of 1084; state is not a verdict - re-read with dsh_result' });
   const still = verdictFields(running, fully);
   assert.equal(still.verdictComplete, false, 'running is running, whatever the window says');
-  assert.equal(still.logExhausted, true, 'but the read did reach the end, and that is worth saying');
-  // "Read to the end and this round recorded nothing" is the unverified-dispatch case, not a timeout.
-  const idle = verdictFields({ settled: false, state: 'idle' }, fully);
+  assert.equal(still.logExhausted, undefined, 'logExhausted is gone: for an unsettled round it was exactly !windowTruncated');
+  // "The log is at its end and this round never started" is the unverified-dispatch case, told apart from
+  // "still in flight" by whether dsh recorded a turn/start - not by a claim about the log's end.
+  const idle = verdictFields({ settled: false, state: 'idle', turnStarted: false }, fully);
   assert.equal(idle.verdictComplete, false);
+  assert.equal(idle.turnStarted, false);
   assert.match(idle.note, /dispatch was not picked up/);
-  const done = verdictFields({ settled: true, state: 'completed' }, fully);
-  assert.deepEqual(done, { windowTruncated: false, verdictComplete: true, logExhausted: true }, 'a settled round gets no note');
+  // The audit's worst reading: the round DID start and its turn/end sits one seq past the snapshot.
+  const late = verdictFields({ settled: false, state: 'idle', turnStarted: true }, fully);
+  assert.match(late.note, /this round started \(first event seq 4\)/);
+  assert.doesNotMatch(late.note, /not picked up/);
+  const done = verdictFields({ settled: true, state: 'completed', turnStarted: true }, fully);
+  assert.deepEqual(done, { windowTruncated: false, verdictComplete: true }, 'a settled round gets no note and no qualifiers');
   assert.deepEqual(verdictFields({ settled: false, state: 'running' }, null),
-    { windowTruncated: false, verdictComplete: false, logExhausted: false }, 'no window is never a verdict');
+    { windowTruncated: false, verdictComplete: false }, 'no window is never a verdict');
+});
+
+test('a failed page read is not reported as the end of the log', () => {
+  // MEASURED shape: the catch in readRound hands back a degraded window, and the old idle branch printed
+  // "the log ends at seq undefined" as a diagnosis - a false claim about dsh's log, with no action in it.
+  const f = verdictFields({ settled: false, state: 'idle', turnStarted: false }, { sinceSeq: 4, truncated: false, readFailed: true });
+  assert.equal(f.windowTruncated, false);
+  assert.equal(f.verdictComplete, false);
+  assert.match(f.note, /could not be read/);
+  assert.doesNotMatch(f.note, /the log ends at seq/);
+  assert.doesNotMatch(f.note, /undefined/);
 });
 
 test('sliceRound keeps a verdict inside its own round', () => {
@@ -374,8 +391,9 @@ test('walkRound pages to a verdict that one window cannot reach', () => {
     assert.equal(r.events[r.events.length - 1].seq, 1084, 'and stops there - seq 1444 belongs to the next round');
     assert.equal(r.window.pages, 3);
     assert.equal(r.window.truncated, false);
-    assert.equal(r.window.reachedLogEnd, false, 'the round was cut at 1084 while the log runs to 1445');
     assert.equal(r.window.newestSeq, 1084);
+    assert.ok(!('reachedLogEnd' in r.window) && !('logExhausted' in r.window),
+      'the round was cut at 1084 while the log runs to 1445 - nothing here may claim the log ended');
     assert.deepEqual(calls.slice(1).map((c) => c.n), [24, 1000, 1000], 'polling stays cheap until a verdict is wanted');
   });
 });
@@ -453,6 +471,13 @@ test('the default reply carries the verdict and nothing else', () => {
     note: 'waiting on a human', lastAssistantText: 'noise' });
   assert.deepEqual(Object.keys(parked).sort(), ['asked', 'note', 'settled', 'state', 'verdictComplete', 'waitingOnHuman'],
     'settled:false and verdictComplete:false are the answer, not an absence of one');
+  // turnStarted rides only in the case that changes what the caller should do next: no verdict AND no
+  // turn/start. An ordinary running poll keeps its old size.
+  assert.deepEqual(pickVerdict({ state: 'idle', settled: false, verdictComplete: false, turnStarted: false }),
+    { settled: false, verdictComplete: false, state: 'idle', turnStarted: false });
+  assert.ok(!('turnStarted' in pickVerdict({ state: 'running', settled: false, verdictComplete: false, turnStarted: true })));
+  assert.ok(!('turnStarted' in pickVerdict({ state: 'completed', settled: true, turnStarted: false })),
+    'a settled round is a verdict; the qualifier goes away with the absence it qualified');
 });
 
 test('capTexts keeps the tail and reports what it dropped', () => {
@@ -478,4 +503,68 @@ test('inFlightRound is the guard against paying twice for a timed-out call', () 
   assert.equal(inFlightRound(s).requestId, 'r2');
   assert.equal(inFlightRound({ rounds: [{ requestId: 'r1', outcome: 'aborted' }] }), null);
   assert.equal(inFlightRound({}), null, 'no rounds at all is not in flight');
+});
+
+test('the classifier reads the clause, not the whole brief (audit regressions)', () => {
+  const WS = 'D:\\AI\\Coding-Workspaces\\dsh-bridge';
+  // "Update the checklist" is about the checklist; the path 25 chars later, in another clause, is only
+  // where the spec lives. A fixed character window used to call that a write and refuse the dispatch.
+  assert.deepEqual(pathsOutsideCwd('Update the checklist; the spec lives at "D:\\CyberE\\Mingw\\bin".', WS).write, [],
+    'a verb in a different clause is not intent for this path');
+  // Polarity survives: a prohibition is not a plan. These briefs are full of 禁止修改.
+  assert.deepEqual(pathsOutsideCwd('禁止覆盖 "D:\\CyberE\\Mingw\\x.conf"，只在仓库内改代码。', WS).write, []);
+  // The dangerous direction: 写入 X + 依据 README. Provenance words are not read-only markers, and the
+  // old table shared one regex for both, which demoted a real write and let a doomed round through.
+  const u1 = pathsOutsideCwd('把审计报告写入 "D:\\CyberE\\Mingw\\out.md"，格式依据 README。', WS);
+  assert.deepEqual(u1.write, ['D:\\CyberE\\Mingw\\out.md'], 'a write stays a write when a source is cited after it');
+  assert.deepEqual(u1.read, []);
+  // Explicit read-only annotation still wins, and the normal shapes are unaffected.
+  assert.deepEqual(pathsOutsideCwd('任务正文：D:\\x\\ticket.md（只读引用）', WS).write, []);
+  assert.deepEqual(pathsOutsideCwd('把结论写入 D:\\x\\report.md', WS).write, ['D:\\x\\report.md']);
+  // The locative shape must stay a write - "在 X 里实现" puts the verb after the path.
+  assert.deepEqual(pathsOutsideCwd('在 D:\\x\\notes.md 里补充一节', WS).write, ['D:\\x\\notes.md']);
+  // MEASURED blind spot: an unquoted path was only scanned if it already existed, so the guard was
+  // invisible exactly when the brief names the deliverable it has not written yet.
+  assert.deepEqual(pathsOutsideCwd('把结论写入 D:\\x\\brand-new-report.md', WS).write, ['D:\\x\\brand-new-report.md'],
+    'a bare path with an extension counts even though nothing is on disk yet');
+  assert.deepEqual(pathsOutsideCwd('工具在 D:\\Program 下', WS).all, [],
+    'a space-truncated directory fragment still stays out of the advisory');
+});
+
+test('a verdict one seq past the snapshot is never called "never dispatched"', async () => {
+  const log = [{ seq: 7, type: 'turn/start', data: {} }];
+  for (let s = 8; s <= 300; s++) log.push({ seq: s, type: 'step/start', data: {} });
+  log.push({ seq: 301, type: 'turn/end', data: { reason: { kind: 'completed' } } });
+  const asOf = 300;
+  const page = (cursor, n) => {
+    const through = Math.min(asOf, cursor + n);
+    const evs = log.filter((e) => e.seq > cursor && e.seq <= through);
+    return { events: evs, window: { asOfSeq: asOf, sinceSeq: cursor, oldestSeq: evs[0]?.seq ?? null,
+      newestSeq: evs[evs.length - 1]?.seq ?? null, truncated: asOf > through } };
+  };
+  const r = await walkRound(page, 4, { walk: true, first: 24 });
+  const i = interpret(r.events, false);
+  const f = verdictFields(i, r.window);
+  assert.equal(i.turnStarted, true, 'the round plainly started at seq 7');
+  assert.doesNotMatch(String(f.note || ''), /not picked up/, 'the wrong prescription is what made an orchestrator re-run finished work');
+  assert.match(String(f.note || ''), /do NOT re-dispatch/);
+  assert.ok(!/undefined/.test(String(f.note || '')), 'a diagnostic never prints undefined to a caller');
+});
+
+test('a settled round is never reported as parked on a human', () => {
+  // A cancelled ask_user_question leaves its dispatch unclosed forever; without the settled gate the
+  // next read of any round whose window still holds that seq claims "waiting on a human".
+  const start = { seq: 700, type: 'tool/ptc-dispatch-start', data: { subCallId: 'c:ptc:1', name: 'ask_user_question',
+    arguments: { questions: [{ header: 'H', question: 'A or B?' }] } } };
+  const events = [start, { seq: 731, type: 'turn/end', data: { reason: { kind: 'aborted', reason: { kind: 'user' } } } }];
+  assert.equal(humanWaits(events).waitingOnHuman, true, 'unfinished: the wait is real');
+  assert.equal(humanWaits(events, [], { settled: true }).waitingOnHuman, false, 'settled: it is history');
+  assert.equal(humanWaits(events, [], { settled: true }).asked.length, 1, 'the evidence stays, only the claim is withdrawn');
+});
+
+test('capTexts cuts on a character boundary, not through one', () => {
+  const r = capTexts([{ turn: 1, text: '中'.repeat(50) }], 100);
+  assert.ok(Buffer.byteLength(r.kept[0].text, 'utf8') <= 100, 'the budget is a byte budget');
+  assert.ok(!r.kept[0].text.includes(String.fromCharCode(0xFFFD)), 'no half character at the cut');
+  assert.equal(r.kept[0].textTruncated, true);
 });

@@ -6,7 +6,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { createLedgerStore, pushRound, LedgerUnconfirmed } from '../lib/ledger-store.mjs';
+import { createLedgerStore, pushRound, mergeRounds, LedgerUnconfirmed } from '../lib/ledger-store.mjs';
 
 function tmpFile(t) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-ledger-'));
@@ -95,4 +95,35 @@ test('a stale lock is taken over, a live one is waited out and the write is stil
   assert.equal(s2.read().second, 1, 'we still write, but confirmed');
   assert.ok(events.some((e) => e.ev === 'ledger-lock-timeout'));
   assert.equal(fs.existsSync(lock), true, 'a lock we did not take is not removed');
+});
+
+test('a stale rounds[] patch must not delete a round another process appended', async (t) => {
+  // dsh_launch reads the alias (rounds: [r1]), then spends several network calls before writing. A
+  // concurrent dsh_send appends r2 in that gap. The store confirms whatever it wrote, so the only thing
+  // that saves r2 is merging rounds by requestId inside the mutation instead of replacing the array.
+  const file = tmpFile(t);
+  fs.writeFileSync(file, JSON.stringify({ a: { sessionId: 'dsh-a', rounds: [{ requestId: 'r1' }] } }));
+  const store = createLedgerStore({ file, sleep });
+  const stale = store.read().a.rounds;
+  fs.writeFileSync(file, JSON.stringify({ a: { sessionId: 'dsh-a', rounds: [{ requestId: 'r1' }, { requestId: 'r2' }] } }));
+  await store.transact((r) => {
+    const prior = r.a || {};
+    r.a = { ...prior, cwd: 'X', rounds: mergeRounds(prior.rounds, stale) };
+  }, { label: 'upsert-alias', alias: 'a' });
+  assert.deepEqual(store.read().a.rounds.map((x) => x.requestId), ['r1', 'r2'], 'neither round is lost');
+  assert.equal(store.read().a.cwd, 'X', 'and the patch still applies');
+});
+
+test('a real disk error at commit is not a LedgerUnconfirmed', async (t) => {
+  // The audit's point: the only typed failure this store raises is "content diverged". EACCES/ENOSPC from
+  // writeFileSync or renameSync come out as bare errors - so a caller that maps ONLY LedgerUnconfirmed to
+  // "here is your round handle" leaves the handle out precisely when the disk is actually broken.
+  const file = tmpFile(t);
+  const fsImpl = { ...fs,
+    renameSync: (from, to) => { if (to === file) throw Object.assign(new Error('EACCES: permission denied'), { code: 'EACCES' }); fs.renameSync(from, to); } };
+  const store = createLedgerStore({ file, fsImpl, sleep });
+  const err = await store.transact((r) => { r.a = { sessionId: 'x' }; }, { label: 'append-round', requestId: 'r1' }).catch((e) => e);
+  assert.ok(err instanceof Error, 'the failure reaches the caller');
+  assert.equal(err instanceof LedgerUnconfirmed, false, 'and it is not the typed one');
+  assert.equal(err.code, 'EACCES');
 });

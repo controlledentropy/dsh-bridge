@@ -35,7 +35,7 @@ import { ARGS, envelope, authCookie, pastCursor, parseAllowlist, allowedText, ch
   unwrapProjections, pathsOutsideCwd, pageWindow as calcWindow, permissionHistory, walkRound,
   approvalState, verdictFields, humanWaits, modelEfforts, pickVerdict, capTexts, inFlightRound,
   PAGE_SIZE, MAX_PAGES } from './lib/api-contract.mjs';
-import { createLedgerStore, pushRound, LedgerUnconfirmed } from './lib/ledger-store.mjs';
+import { createLedgerStore, pushRound, mergeRounds } from './lib/ledger-store.mjs';
 import { createAuditLog } from './lib/audit-log.mjs';
 import { findSiblings, applySupersedes, commonPrefixLength } from './lib/alias-hygiene.mjs';
 
@@ -95,22 +95,35 @@ const ledgerStore = createLedgerStore({ file: REG_FILE, pid: PID, sleep, onEvent
 const readLedger = () => ledgerStore.read();
 // Post-dispatch, an unconfirmed ledger write is not the round's failure - the prompt already left. The
 // caller still has to see it, with the handle, because nothing else in dsh can hand the round back.
-function ledgerRiskFields(e, round = {}) {
-  return { ledgerAtRisk: true, ledgerNote: String(e.message),
-    unrecordedRound: { alias: e.detail?.alias ?? null, requestId: e.detail?.requestId ?? round.requestId ?? null,
-      sinceSeq: round.sinceSeq ?? null } };
+// The two situations look alike and mean opposite things, so each says which one it is: a round that was
+// dispatched and never recorded has no other copy of its handle, while a failed outcome refresh leaves a
+// perfectly good answer whose ledger copy is merely stale.
+function ledgerRiskFields(e, round = {}, note) {
+  const detail = String(e?.message ?? e);
+  return { ledgerAtRisk: true, ledgerNote: note ? `${note} (${detail})` : detail,
+    unrecordedRound: { alias: e?.detail?.alias ?? round.alias ?? null,
+      requestId: e?.detail?.requestId ?? round.requestId ?? null, sinceSeq: round.sinceSeq ?? null } };
 }
+// MEASURED failure mode (audit): the branch that carries the handle only fired for LedgerUnconfirmed,
+// so the errors that actually come from a real disk - EACCES / ENOSPC from writeFileSync or renameSync -
+// reached the caller as a bare failure with no requestId, on a round whose prompt had already left. That
+// is the exact situation the handle exists for, so EVERY post-dispatch write failure returns it.
 async function recordRound(alias, round) {
   try { return { rounds: await appendRound(alias, round), risk: null }; }
   catch (e) {
-    if (!(e instanceof LedgerUnconfirmed)) throw e;
-    log({ ev: 'ledger-at-risk', alias, requestId: round.requestId });
-    return { rounds: null, risk: ledgerRiskFields(e, round) };
+    log({ ev: 'ledger-at-risk', alias, requestId: round.requestId, error: String(e && e.message || e) });
+    return { rounds: null, risk: ledgerRiskFields(e, { ...round, alias },
+      'the prompt WAS dispatched and this round is not in the ledger - the handle here is its only copy') };
   }
 }
 async function upsertAlias(alias, patch) {
   let out = null;
-  await ledgerStore.transact((r) => { out = (r[alias] = { ...(r[alias] || {}), ...patch }); }, { label: 'upsert-alias', alias });
+  // rounds are merged, never replaced: the caller read them before creating/joining/pinning over the
+  // network, and another process may have appended a round in that window.
+  await ledgerStore.transact((r) => {
+    const prior = r[alias] || {};
+    out = (r[alias] = { ...prior, ...patch, rounds: mergeRounds(prior.rounds, patch.rounds) });
+  }, { label: 'upsert-alias', alias });
   return out;
 }
 async function appendRound(alias, round) {
@@ -124,17 +137,21 @@ async function appendRound(alias, round) {
 // MEASURED failure mode: a round persisted as "running" stayed that way forever even though its
 // turn/end (aborted) was on disk, so the ledger contradicted the log. A later read that does see the
 // verdict writes it back. Bookkeeping only: the answer the caller is holding does not depend on it.
-async function refreshOutcome(alias, requestId, state) {
+async function refreshOutcome(alias, round, state) {
+  const requestId = round?.requestId;
   if (!requestId || !state) return null;
   try {
     await ledgerStore.transact((r) => {
-      const round = (r[alias]?.rounds || []).find((x) => x.requestId === requestId);
-      if (round && round.outcome !== state) { round.outcome = state; log({ ev: 'outcome-refreshed', alias, requestId, state }); }
+      const hit = (r[alias]?.rounds || []).find((x) => x.requestId === requestId);
+      if (hit && hit.outcome !== state) { hit.outcome = state; log({ ev: 'outcome-refreshed', alias, requestId, state }); }
     }, { label: 'refresh-outcome', alias, requestId });
     return null;
   } catch (e) {
-    if (!(e instanceof LedgerUnconfirmed)) throw e;
-    const risk = ledgerRiskFields(e, { requestId }); log({ ev: 'ledger-at-risk', ...risk }); return risk;
+    // MEASURED (audit, this round): a raw EPERM here used to fail the whole tool call, so the caller
+    // lost a verdict it had already read. Bookkeeping never outranks the answer.
+    const risk = ledgerRiskFields(e, { ...round, alias },
+      'this answer came from dsh\'s own log and stands; only the ledger copy of the outcome is stale');
+    log({ ev: 'ledger-at-risk', ...risk }); return risk;
   }
 }
 function regGet(alias) {
@@ -281,7 +298,7 @@ async function sessionScope(sessionId, hints = {}) {
 // below, and the corrected value travels back out through window.asOfSeq.
 async function pageWindow(sessionId, sinceSeq, maxMessages = 20, anchored = 'baseline', asOfHint = null) {
   let asOfSeq = Number.isFinite(asOfHint) && asOfHint > 0 ? asOfHint : await asOf(sessionId);
-  if (!asOfSeq) return { events: [], window: { sinceSeq: sinceSeq || 0, throughSeq: 0, asOfSeq: 0, anchored, truncated: false, reachedLogEnd: false },
+  if (!asOfSeq) return { events: [], window: { sinceSeq: sinceSeq || 0, throughSeq: 0, asOfSeq: 0, anchored, truncated: false },
     note: 'no readable log yet (asOfSeq=0)' };
   let w = calcWindow({ sinceSeq: sinceSeq || 0, asOfSeq, maxMessages, anchored });
   for (let attempt = 0; attempt < 3; attempt++) {
@@ -339,7 +356,8 @@ async function readRound(s, opts = {}) {
   // actually possible, otherwise every poll re-reads a thousand events.
   const settledHint = row?.running === false;
   const { events, window } = await readRoundEvents(s.sessionId, sinceSeq,
-    { walk: opts.walk ?? settledHint, first: opts.first ?? 24, asOfSeq: opts.asOfSeq }).catch(() => ({ events: [], window: { sinceSeq, truncated: false } }));
+    { walk: opts.walk ?? settledHint, first: opts.first ?? 24, asOfSeq: opts.asOfSeq })
+    .catch(() => ({ events: [], window: { sinceSeq, truncated: false, readFailed: true } }));
   const p = opts.p ?? await projections(s.sessionId).catch(() => null);
   const r = interpret(events, row?.running ?? null);
   const ap = approvalState(events);
@@ -349,16 +367,17 @@ async function readRound(s, opts = {}) {
   // cannot leak into state even though the tail is read.
   const tail = settledHint ? [] : (await pageTail(s.sessionId, 40).catch(() => ({ events: [] }))).events;
   const scan = [...new Map([...events, ...tail].map((e) => [e?.seq, e])).values()].sort((a, b) => a.seq - b.seq);
-  const hw = humanWaits(scan, p?.userQuestions?.active || []);
+  const hw = humanWaits(scan, p?.userQuestions?.active || [], { settled: r.settled });
   const v = verdictFields(r, window);
   // A round parked on a person outranks every other reading of it, and there are two ways to be parked:
   // an approval queue entry, or an unanswered ask_user_question riding a PTC dispatch. Watching only the
-  // first reported a 102-second human wait as "still running".
+  // first reported a 102-second human wait as "still running". The verdict note stays in front of it -
+  // "no verdict yet" and "a person is holding it" are both actionable, so neither replaces the other.
   if (!r.settled && (ap.pending.length || hw.asked.length)) {
     const bits = [];
     if (ap.pending.length) bits.push(`${ap.pending.length} approval(s): ${ap.pending.map((x) => x.toolName).join(', ')}`);
     if (hw.asked.length) bits.push(`${hw.asked.length} question(s): ${hw.asked.map((w) => (w.questions?.[0]?.header || w.name)).join(', ')}`);
-    v.note = `waiting on a human - ${bits.join(' ; ')}; an unattended dispatch cannot proceed until someone answers in the dsh UI`;
+    v.note = [v.note, `waiting on a human - ${bits.join(' ; ')}; an unattended dispatch cannot proceed until someone answers in the dsh UI`].filter(Boolean).join(' | ');
   }
   return { ...r, ...ap, ...hw, window, ...v,
     model: modelLabel(p?.modelSelection?.lastUsed || lastRound(s).pinned || s.pinned),
@@ -716,7 +735,7 @@ tool('dsh_wait', {
       await sleep(CFG.pollMs);
       r = await readRound(s);
     }
-    const bookkeeping = r.settled ? await refreshOutcome(alias, lastRound(s).requestId, r.state) : null;
+    const bookkeeping = r.settled ? await refreshOutcome(alias, lastRound(s), r.state) : null;
     const slim = { ok: true, alias, round: (s.rounds || []).length, requestId: lastRound(s).requestId || null,
       waitedMs: Date.now() - started, ...(bookkeeping || {}), ...pickVerdict(r) };
     return json(detail ? { ...slim, approvalPolicy: r.approvalPolicy ?? null, lastAssistantText: r.lastAssistantText,
@@ -744,7 +763,7 @@ tool('dsh_status', {
     const scope = await sessionScope(s.sessionId, hints).catch(() => null);
     // A status read that sees the verdict must write it back too: a recovery loop that only ever calls
     // dsh_status would otherwise leave the ledger saying "running" for a round that finished.
-    const bookkeeping = r.settled ? await refreshOutcome(alias, lastRound(s).requestId, r.state) : null;
+    const bookkeeping = r.settled ? await refreshOutcome(alias, lastRound(s), r.state) : null;
     const slim = { ok: true, alias, round: (s.rounds || []).length, requestId: lastRound(s).requestId || null,
       unattended: scope?.unattended ?? null, ...bookkeeping, ...pickVerdict(r) };
     return json(detail ? { ...slim, approvalPolicy: scope?.approvalPolicy ?? null,
@@ -778,7 +797,7 @@ tool('dsh_result', {
     const p = await projections(s.sessionId).catch(() => null);
     const r = interpret(events, (await liveRow(s.sessionId))?.running ?? null);
     const bookkeeping = (r.settled && target.outcome !== r.state)
-      ? await refreshOutcome(alias, target.requestId, r.state) : null;
+      ? await refreshOutcome(alias, target, r.state) : null;
     // assistant/message events are one per step and mostly carry no text at all (tool-only messages) -
     // measured: 138 of them held ~4 KB of text inside 15 KB of JSON. Empty ones are not content.
     const texts = events.filter((e) => e.type === 'assistant/message')
@@ -788,7 +807,7 @@ tool('dsh_result', {
     // does it - state, the qualifiers, and whether a human is holding the round (a result read that
     // could not see `waitingOnHuman` would send an orchestrator back to polling a parked round).
     const fields = { ...verdictFields(r, window), ...approvalState(events),
-      ...humanWaits(events, p?.userQuestions?.active || []) };
+      ...humanWaits(events, p?.userQuestions?.active || [], { settled: r.settled }) };
     const verdict = { ok: true, alias, round: round || rounds.length, requestId: target.requestId || null,
       correlated: target.correlated ?? null, model: modelLabel(p?.modelSelection?.lastUsed || target.pinned || s.pinned),
       ...pickVerdict({ ...r, ...fields }), ...(bookkeeping || {}),
@@ -798,12 +817,12 @@ tool('dsh_result', {
         sha256: createHash('sha256').update(target.task).digest('hex').slice(0, 16) } : null };
     if (only === 'full') {
       const cap = capTexts(texts, maxTextBytes);
-      return json({ ...verdict, assistantTexts: cap.kept, ...(cap.truncated ? { textsTruncated: cap.droppedCount, note: cap.note } : {}),
+      return json({ ...verdict, assistantTexts: cap.kept, ...(cap.truncated ? { textsTruncated: cap.droppedCount, textsNote: cap.note } : {}),
         toolCalls: r.toolCalls, toolErrors: r.toolErrors, touchedFiles: r.touchedFiles,
         turnOutline: (p?.turnOutline || []).slice(-6), window, tokenUsage: p?.tokenUsage || null });
     }
     const cap = capTexts(texts.slice(-1), maxTextBytes);
-    return json({ ...verdict, finalText: cap.kept[0]?.text ?? '', ...(cap.truncated ? { note: cap.note } : {}),
+    return json({ ...verdict, finalText: cap.kept[0]?.text ?? '', ...(cap.truncated ? { textsNote: cap.note } : {}),
       errors: r.toolErrors.map((x) => ({ code: x.code, name: x.name })), touchedFiles: r.touchedFiles,
       hint: 'finalText is only the closing message; for the whole round pass only:"full". touchedFiles is a hint mined from tool output, not authority - verify against the files or git.' });
   } catch (e) { return fail(e); }

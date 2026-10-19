@@ -210,7 +210,7 @@ dsh_status {alias}                 查看模型、token 用量和上下文压力
 
 会话的写入边界就是它的 `cwd`。**"提到一个路径"和"要往那个路径写"是两件事**，桥接按路径附近的意图词分级（中文动词后置的写法也算，例如"在 X 里实现"）：只有判定为**写入**工作区外路径的派单会被拒绝下发（错误里列出这些路径），因为那一轮注定被沙箱拒绝、只会白烧额度；只读提及（工单正文在父仓、技能定义在 `~/.agents/skills`、工具在 `Program Files`）只在返回里告警。返回的 `outsideCwd` 是 `{ all, write, read }` 三档，`allowOutsideCwd: true` 越过 write 档。分级是启发式，判错时用这个参数显式放行即可。任务要改动别的仓库时，以那个仓库作为 `cwd` 建会话（侧边栏分栏跟随 `cwd`），不要在 A 工作区的会话里写 B 目录。
 
-一轮可以横跨上千条事件，任何固定大小的窗口都是在猜本轮有多长，所以判决读取是**从本轮 baseline 起沿游标向前走（首页 24 条、之后每页 1000 条、上限 12 页）直到本轮自己的 `turn/end` 落进已读事件，再截断到该事件**：既不会把下一轮的 `completed` 当成本轮结论，也不会因为窗口够不到而把一个已完成的轮次读成 `idle`（即"什么都没发生"）。这两种翻车都实测过。三个字段各司其职，不要合并理解：`verdictComplete` **只表示本轮自己的 `turn/end` 已读到**（等于 `settled`，正常运行中一定是 `false`）；`windowTruncated:true` 表示还没读到日志末尾，此时 `state` 不是判决，要用 `dsh_result` 重读；`logExhausted:true` 且 `state:"idle"` 表示日志已到末尾而这轮压根没记录 `turn/start`/`turn/end`，即派单没被接手。`window.newestSeq` 只报截断后真正读到的位置。中止还会带 `abortReason`（实测 `user` 表示是人中止的，不是 dsh 自己放弃）。
+一轮可以横跨上千条事件，任何固定大小的窗口都是在猜本轮有多长，所以判决读取是**从本轮 baseline 起沿游标向前走（首页 24 条、之后每页 1000 条、上限 12 页）直到本轮自己的 `turn/end` 落进已读事件，再截断到该事件**：既不会把下一轮的 `completed` 当成本轮结论，也不会因为窗口够不到而把一个已完成的轮次读成 `idle`（即"什么都没发生"）。这两种翻车都实测过。字段各司其职，不要合并理解：`verdictComplete` **只表示本轮自己的 `turn/end` 已读到**（等于 `settled`，正常运行中一定是 `false`）；`windowTruncated:true` 表示**这次读取的快照没覆盖到判决**，此时 `state` 不是判决，要用 `dsh_result` 重读，**不要重发**——实测判决只差 1 个 seq 时旧版本说"派单没被接手"，而 `turn/start` 明明就在 seq 7，那句处方会让编排方重跑一轮已完成的工作。没有判决且本轮**连 `turn/start` 都没读到**时，回复才带 `turnStarted:false`，这才是"派单没被接手"。读页本身失败时不会谎称日志到了末尾，`note` 会直说"本轮什么都没被验证，重读"。曾经还有第三个字段 `logExhausted`，2026-10-19 审计后删掉：对未落定的轮次它恒等于 `!windowTruncated`（`asOfSeq > lastSeq` 与 `asOfSeq <= lastSeq` 互为反面），不携带任何信息，而它的名字承诺了"日志到此为止"——日志是边读边增长的，这个事实桥无法知道。`window.newestSeq` 只报截断后真正读到的位置。中止还会带 `abortReason`（实测 `user` 表示是人中止的，不是 dsh 自己放弃）。
 
 **要求 `git commit` 的任务在 `workspace-write` 下结构性不可行**：git worktree 的索引与对象元数据位于主仓的 `.git/worktrees/<name>/`，在会话工作区之外，因此每次提交都会触发审批。派单里要提交，就必须要么下发前由人把会话提到 `danger-full-access`，要么让执行者只产出改动、提交由会话外的人做。
 
@@ -229,7 +229,7 @@ dsh_status {alias}                 查看模型、token 用量和上下文压力
 | `dsh_adopt` | `alias`, `sessionId`, `cwd`; 可选 `phase` 等 | 接管已存在的 `dsh web` 会话，不改变其分栏 |
 | `dsh_wait` | `alias`; 可选 `maxSeconds`（≤ 45） | 在限定时间内等待本轮完成；返回本轮自己的判决（`state` / `verdictComplete`）。**本轮停在人身上时立即返回**（实测 50 ms）：审批看 `pending[]`，待人回答的提问看 `waitingOnHuman` / `asked[]`（含问题与选项） |
 | `dsh_status` | `alias` | 返回本轮状态、模型、token 用量、上下文压力、待答问题，以及会话边界信息：`workingDirectory`、`sandbox`（如 `workspace-write`）、`agentPreset`、`approvalPolicy` / `unattended`（能否无人值守）、`sessionStats` |
-| `dsh_result` | `alias`; 可选 `messages`（首页事件数，≤ 1000）、`round` | 获取某一轮（默认最新一轮）的验收载荷：**该轮全部**助手文本、工具调用、落盘文件、`toolErrors[]`（含失败正文与错误码）、`sandboxDenials`、`window` / `windowTruncated` / `verdictComplete` / `logExhausted`。`messages` 只影响首页大小，不影响完整性 |
+| `dsh_result` | `alias`; 可选 `only`（`final`/`full`）、`maxTextBytes`、`messages`（首页事件数，≤ 1000）、`round` | 获取某一轮（默认最新一轮）的验收载荷：**该轮全部**助手文本、工具调用、落盘文件、`toolErrors[]`（含失败正文与错误码）、`sandboxDenials`、`window` / `windowTruncated` / `verdictComplete` / `turnStarted`（仅在还没有判决时才出现）。文本被预算裁短时用 `textsNote` 单独说明，**不会**顶掉 `note` 里那条"还没有判决，去重读"的动作指令。`messages` 只影响首页大小，不影响完整性 |
 | `dsh_sessions` | 可选 `cwd` | 查看桥接持有的别名（含 `supersedes` / `supersededBy` 替代关系），以及本进程的审计日志状态 `logging`；传入 `cwd` 时额外查询该工作区的活会话 |
 | `dsh_cancel` | `alias` | 请求取消当前轮；需再次检查最终状态 |
 
@@ -308,7 +308,7 @@ DSH_NO_SPAWN = '1'
 - [ ] `dsh web` 仅供可信本机程序连接；不对公网暴露 owner 凭据或本机 API。
 - [ ] `DSH_BRIDGE_STATE`（含保留完整任务文本的 `sessions.json`）和 stdout 捕获文件只对授权用户可读；**Windows 上 `chmod` 不生效**，用 `node launch.mjs doctor` 读实际 ACL（`acl.foreignReaders`），必要时 `node launch.mjs lock-acl`。
 - [ ] 同一状态目录由需要共享别名的客户端共同使用；不同环境使用不同状态目录。
-- [ ] 同一个别名不会被两个客户端**同时派发**任务（一轮只应有一个在途 prompt）。账本每次写入都会"读—改—写—读回确认"，被并发覆盖时自动重试，重试仍不确认就返回 `ledgerAtRisk:true` 与轮次句柄（见 `docs/ORCHESTRATION.md` §8）——但**不要**把这当作可以并发派同一别名的许可。
+- [ ] 同一个别名不会被两个客户端**同时派发**任务（一轮只应有一个在途 prompt）。账本每次写入都会"读—改—写—读回确认"，被并发覆盖时自动重试；**任何**写不进的情况（重试仍不确认，或盘本身报错 EACCES/ENOSPC/EPERM）都返回 `ledgerAtRisk:true` + `unrecordedRound{alias,requestId,sinceSeq}`，而不是一个不带句柄的裸错误（见 `docs/ORCHESTRATION.md` §8）——但**不要**把这当作可以并发派同一别名的许可。
 - [ ] 所有下发任务使用可写、可回滚的工作区，并由调用方审查结果。
 - [ ] 变更 `dsh` 版本、profile 或 MCP 配置后，重新运行预检和连通性验证。
 
@@ -419,7 +419,12 @@ GitHub Actions 工作流配置在 Linux / Windows、Node.js 20 / 22 上运行离
 | `lib/api-contract.mjs` | `/api` 请求与响应的适配 |
 | `lib/remote-surface.mjs` | 解析 dsh 随包的 RPC 方法表（纯函数，可用 fixture 离线测） |
 | `docs/REMOTE-SURFACE.md` | **生成物**：本机 dsh 会转发哪些方法，及其官方描述与名称摘要 |
+| `tools/ledger-risk-probe.mjs` | **可重跑的取证工具**（仅 Windows，需活实例）：复制状态目录并对副本注入"账本写不进"，验证派发/审计调用仍带回句柄、且不毁掉已读到的判决。不派发任何轮次，不消耗额度 |
 | `tests/contract.test.mjs` | 离线契约回归测试 |
+
+审计记录按日期存放。外部审计的原文（`AUDIT-2026-10-19.md`）含有本机绝对路径与实例细节，**没有**随仓库公开，需要可向维护方索取；本项目的裁决与复现结果随仓库提交：
+
+- [`AUDIT-RESPONSE-2026-10-19.md`](AUDIT-RESPONSE-2026-10-19.md) — 对 `275b7c1..fa9ba3d` 那份外部审计的 7 条断言逐条独立裁决（成立/未证实）、活体前后对比、以及审计没抓到的一个盲区（未加引号且尚不存在的路径原先完全不进 cwd 守卫）。文中引用的复现输出与 `tools/ledger-risk-probe.mjs` 可重跑。
 
 升级建议：
 
