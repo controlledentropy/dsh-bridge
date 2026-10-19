@@ -21,4 +21,18 @@ jobs:
           node-version: ${{ matrix.node }}
           cache: npm
       - run: npm ci
-      - run: npm test
+      # A red check that nobody can read is not a signal. Job logs need repo admin, so the failing test
+      # names are also emitted as check annotations - those are readable through the public Checks API,
+      # which is how a maintainer without a token finds out what broke.
+      - name: npm test
+        shell: bash
+        run: |
+          set +e
+          npm test > test.log 2>&1
+          code=$?
+          cat test.log
+          if [ "$code" -ne 0 ]; then
+            echo "::error::npm test exited $code on ${{ matrix.os }}, node ${{ matrix.node }}"
+            grep -E "^not ok|^# fail" test.log | while IFS= read -r l; do echo "::error::${l}"; done
+          fi
+          exit "$code"
