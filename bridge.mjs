@@ -3,13 +3,18 @@
 // sessions over their /api.
 //
 // The wire format lives in lib/api-contract.mjs and is documented, with the probes to re-run after a
-// dsh upgrade, in docs/API-CONTRACT.md. This file is only: auth, transport, the session ledger, and
-// the nine tools. Facts marked MEASURED were established by execution against dsh 0.2.1-rc.2 here.
+// dsh upgrade, in docs/API-CONTRACT.md; the full set of methods this dsh build will forward is
+// generated into docs/REMOTE-SURFACE.md by tools/remote-surface.mjs. This file is only: auth,
+// transport, the session ledger, and the ten tools. Facts marked MEASURED were established by execution
+// against dsh 0.2.1-rc.2 here.
 //
-//   auth      The one-time launch token exists only on `dsh web` stdout and is never persisted. It is
-//             exchanged at GET /connect?token=&interactions=answer for a signed `dsh-auth-*` cookie =
-//             owner principal, which dsh does not re-check per call. Re-/connect recovers a cookie
-//             invalidated by a closed peer.
+//   auth      The launch token appears on `dsh web` stdout, and this bridge only ever *reads* it - it
+//             never writes one anywhere of its own. It is a replayable bearer credential, not a
+//             one-time passphrase (MEASURED: two /connect calls with one token mint two different,
+//             both-valid cookies), and GET /connect?token=&interactions=answer turns it into a signed
+//             `dsh-auth-*` cookie = owner principal, which dsh does not re-check per call. Re-/connect
+//             recovers a cookie invalidated by a closed peer. So the capture file's ACL is the real
+//             security boundary on this machine - see launch.mjs's tokenAcl().
 //   traps     {accepted:true} is admission, not completion. session/list.running does not separate
 //             success from failure. Old turns stay in the log, so an outcome is only readable from
 //             events after the round's baseline seq. Projections for sessions this bridge did not
@@ -489,7 +494,7 @@ tool('dsh_permissions', {
     const cat = await call('permissionPresets/catalog', ARGS.permissionCatalog()).catch(() => null);
     const out = { ok: true, presets: (cat?.options || []).map((o) => o.value), defaultPreset: cat?.defaultPreset || null,
       settableOverApi: false,
-      note: 'permissionPresets/set, permissionPresets/current and session/setSandboxMode are not forwarded by the gateway (404). The only programmatic switch is the in-session /permission command, which this bridge deliberately does not call: raising a sandbox is a human decision.' };
+      note: 'No sandbox-preset setter is forwarded: permissionPresets/set, permissionPresets/current and session/setSandboxMode are absent from the method table shipped by dsh (see docs/REMOTE-SURFACE.md), so raising a running session is a human action in the dsh UI. agentPresets/select does exist but only applies before a session\'s first turn, and terminal/create is forwarded with a description that explicitly puts it outside the agent sandbox and approval path - this bridge deliberately calls neither.' };
     if (alias) {
       const s = regGet(alias);
       const p = await projections(s.sessionId).catch(() => null);

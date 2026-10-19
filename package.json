@@ -39,8 +39,10 @@
     "README.md"
   ],
   "scripts": {
-    "test": "node --test \"tests/*.test.mjs\"",
+    "test": "node --test tests/contract.test.mjs tests/mcp.test.mjs tests/remote-surface.test.mjs",
     "preflight": "node launch.mjs check",
+    "surface": "node tools/remote-surface.mjs",
+    "surface:check": "node tools/remote-surface.mjs --check",
     "doctor": "node launch.mjs doctor",
     "start": "node launch.mjs start",
     "check:live": "node tests/live-check.mjs"

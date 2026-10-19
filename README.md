@@ -60,7 +60,7 @@ Codex / Claude Desktop / Cursor
 2. **按轮验收**：`accepted: true` 仅表示收到请求；只有 `state: "completed"` 表示本轮正常结束，仍应检查结果和产物。
 3. **先预检后执行**：别名、目录、模型和推理强度不符合策略时，桥接会在调用 `/api` 前拒绝请求。
 
-启动鉴权使用 `dsh web` 写到 **stdout** 的一次性启动 token；桥接通过捕获文件读取 token 并建立本机 API 连接。相关实现与协议细节见 [docs/API-CONTRACT.md](docs/API-CONTRACT.md)。
+启动鉴权使用 `dsh web` 写到 **stdout** 的启动 token；桥接通过捕获文件读取 token 并建立本机 API 连接。**它是可重放的 bearer 凭据，不是一次性口令**：实测同一 token 连续两次 `/connect` 会各自签发出**不同**且都有效的 owner cookie，直到实例重启才失效——所以捕获文件的可读性就是这台机器上 dsh 实例的权限边界（见"安全与使用边界"）。相关实现与协议细节见 [docs/API-CONTRACT.md](docs/API-CONTRACT.md)。
 
 ## 快速开始
 
@@ -207,7 +207,7 @@ dsh_status {alias}                 查看模型、token 用量和上下文压力
 | 工具 | 主要参数 | 作用 |
 | --- | --- | --- |
 | `dsh_models` | 无 | 返回实时模型目录与允许清单的交集，包含默认模型、可路由 provider 和加载失败信息 |
-| `dsh_permissions` | 可选 `alias` | **只读**查看沙箱面：dsh 提供的档位（`read-only` / `workspace-write` / `danger-full-access`）、实例默认档位；给了 `alias` 还会返回该会话的生效档位与变更史（`escalated`、`escalatedBy`、`approvals`）。**改档位不在这里**：`/api` 上没有 per-session 写入口，只能在 dsh UI 里由人操作 |
+| `dsh_permissions` | 可选 `alias` | **只读**查看沙箱面：dsh 提供的档位（`read-only` / `workspace-write` / `danger-full-access`）、实例默认档位；给了 `alias` 还会返回该会话的生效档位与变更史（`escalated`、`escalatedBy`、`approvals`）。**运行中的会话改不了沙箱档位**：dsh 随包方法表里没有 per-session 的档位写入口（`permissionPresets/set`、`session/setSandboxMode` 都不存在），只能在 dsh UI 里由人操作。`agentPresets/select` 存在但只对**首轮之前**的会话生效，`terminal/create` 的官方描述明示绕过 Agent 沙箱与审批——桥接刻意都不调用，理由见 [docs/REMOTE-SURFACE.md](docs/REMOTE-SURFACE.md) |
 | `dsh_launch` | `alias`, `cwd`, `task`; 可选 `phase`, `group`, `dryRun`, `allowOutsideCwd`, `model`, `reasoningEffort` | 新建命名会话、设置模型并提交第一轮；`dryRun` 只创建会话，不执行任务。任务被判定为**向工作区外写入**时在下发前拒绝，只读提及外部路径不拦 |
 | `dsh_send` | `alias`, `task`; 可选 `allowOutsideCwd`, `model`, `reasoningEffort` | 向同一会话提交下一轮（同一阶段返工用它，新阶段用新 `alias`） |
 | `dsh_adopt` | `alias`, `sessionId`, `cwd`; 可选 `phase` 等 | 接管已存在的 `dsh web` 会话，不改变其分栏 |
@@ -290,9 +290,9 @@ DSH_NO_SPAWN = '1'
 ### 上线前检查
 
 - [ ] `dsh web` 仅供可信本机程序连接；不对公网暴露 owner 凭据或本机 API。
-- [ ] `DSH_BRIDGE_STATE`（含保留完整任务文本的 `sessions.json`）和 stdout 捕获文件只对授权用户可读；Windows 额外检查目录 ACL。
+- [ ] `DSH_BRIDGE_STATE`（含保留完整任务文本的 `sessions.json`）和 stdout 捕获文件只对授权用户可读；**Windows 上 `chmod` 不生效**，用 `node launch.mjs doctor` 读实际 ACL（`acl.foreignReaders`），必要时 `node launch.mjs lock-acl`。
 - [ ] 同一状态目录由需要共享别名的客户端共同使用；不同环境使用不同状态目录。
-- [ ] 同一个别名不会被两个客户端**同时派发**任务；账本支持并发安全写入，但不保证同一别名多轮并发的语义正确。
+- [ ] 同一个别名不会被两个客户端**同时派发**任务。账本写入是原子的（临时文件 + rename），但**并发读改写仍可能让后写者覆盖前者的轮次记录**——拿锁超时时桥选择"照样写并记一条 `ledger-lock-timeout`"，而不是丢掉已派发任务的句柄。所以并发安全指"不会写出半个文件"，不保证"多轮并发语义正确"。
 - [ ] 所有下发任务使用可写、可回滚的工作区，并由调用方审查结果。
 - [ ] 变更 `dsh` 版本、profile 或 MCP 配置后，重新运行预检和连通性验证。
 
@@ -313,12 +313,16 @@ node launch.mjs stop        # 仅停止桥接记录为自己管理的实例
 ### 契约测试与诊断工具
 
 ```bash
-npm test                                  # 31 个离线契约 / MCP 子进程测试
+npm test                                  # 34 个离线契约 / 远端面解析 / MCP 子进程测试
 node tests/live-check.mjs                 # 已运行实例的只读复验（需能读取当前实例的启动 token）
+node tools/remote-surface.mjs             # 从本机 dsh 包重新生成 docs/REMOTE-SURFACE.md（135 个可转发方法）
+node tools/remote-surface.mjs --check     # 只比对：升级后方法表与文档是否漂移（退出码非 0 即漂移）
 node tools/probe-api.mjs                  # 探查 /api 端点参数形状
 node tools/probe-acp.mjs                  # 检查 ACP 接口
 node tools/read-session-log.mjs <file>    # 解码多帧 zstd 会话日志
 ```
+
+`npm test` 显式列出测试文件而不用 glob：`node --test` 对 glob 参数的支持随 Node 版本而异，而本包声明支持 Node 18+， glob 写法可能在受支持版本上直接找不到测试文件（**本机只有 Node 24，未在 Node 20 上实测**，列出文件名对两者都成立）。新增测试文件时记得同时加进 `package.json` 的 `scripts.test`。
 
 以下选项**不属于零副作用检查**，请只在可测试的环境里使用：
 
@@ -396,14 +400,17 @@ GitHub Actions 工作流配置在 Linux / Windows、Node.js 20 / 22 上运行离
 | `bridge.mjs` | MCP 传输和工具定义 |
 | `launch.mjs` | 启动、进程、凭据、版本检查 |
 | `lib/api-contract.mjs` | `/api` 请求与响应的适配 |
+| `lib/remote-surface.mjs` | 解析 dsh 随包的 RPC 方法表（纯函数，可用 fixture 离线测） |
+| `docs/REMOTE-SURFACE.md` | **生成物**：本机 dsh 会转发哪些方法，及其官方描述与名称摘要 |
 | `tests/contract.test.mjs` | 离线契约回归测试 |
 
 升级建议：
 
 1. 记录当前 `dsh` 版本，备份 profile 和必要的本机状态。
-2. 执行 `npm test`、`node launch.mjs check` 和 `node launch.mjs doctor`。
-3. 若 `/api` 结构改变，按照 [docs/API-CONTRACT.md](docs/API-CONTRACT.md) 的重建步骤重新探查，以实际观测修订契约测试，再修改适配层。
-4. 在隔离的测试工作区进行真实任务验证后，再恢复日常使用。
+2. 执行 `npm test`、`node launch.mjs check` 和 `node launch.mjs doctor`。`check` 会顺带比对**远端面漂移**：方法名摘要变了、或桥接调用的方法在这份 dsh 里不存在，都会进 `problems` 并给出 `node tools/remote-surface.mjs` 的重生成指令。
+3. 跑 `node tools/remote-surface.mjs` 重新生成方法表，读一遍 `addedSinceDoc` / `removedSinceDoc`：**新增**意味着可能有新能力（也意味着旧文档里"做不到"的说法可能过期），**移除**意味着有工具会开始报错。
+4. 若 `/api` 结构改变，按照 [docs/API-CONTRACT.md](docs/API-CONTRACT.md) 的重建步骤重新探查，以实际观测修订契约测试，再修改适配层。
+5. 在隔离的测试工作区进行真实任务验证后，再恢复日常使用。
 
 ## 贡献与许可
 
