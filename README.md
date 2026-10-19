@@ -6,7 +6,7 @@
 
 无需修改 `dsh`，也无需在 Codex 中安装专用插件。
 
-> **兼容性说明**：当前已在 `@deepseek-ai/dsh@0.2.1-rc.2`、Windows 11、Node.js 24 上完成实机验证。项目要求 Node.js **≥ 18.14**；GitHub Actions 已配置在 Linux / Windows、Node.js 20 / 22 上运行离线测试，跨版本结果以实际 CI 运行为准。`dsh web` 的 `/api` 并非稳定公开契约，升级 `dsh` 后请先按[兼容性与升级](#兼容性与升级)检查。
+> **兼容性说明**：当前已在 `@deepseek-ai/dsh@0.2.1-rc.2`、Windows 11、Node.js 24 上完成实机验证。项目要求 Node.js **≥ 18.14**；GitHub Actions 在 **Windows**、Node.js 20 / 22 上跑离线测试。之所以只跑 Windows：这套测试断言的是 cwd 守卫的**盘符语义**（`D:\x\a.md` 相对 `D:\work\p` 算越界、`pnpm.cmd` 按 PATHEXT 优先于 `pnpm.ps1`），而守卫目前只识别盘符路径——**posix 绝对路径（`/etc/x` 这类）不在它的识别范围内**，这不是缺陷清单里的意外，而是尚未做的功能；把它算进 CI 只会报告一个没人要的兼容性承诺。`dsh web` 的 `/api` 并非稳定公开契约，升级 `dsh` 后请先按[兼容性与升级](#兼容性与升级)检查。
 
 ## 目录
 
@@ -355,7 +355,7 @@ node tools/read-session-log.mjs <file>    # 解码多帧 zstd 会话日志
 | `probe-api --mutate` | 允许探查时创建会话 |
 | `probe-acp --prompt` | 允许发出真实任务 |
 
-GitHub Actions 工作流配置在 Linux / Windows、Node.js 20 / 22 上运行离线测试；**首次 CI 是否通过应以实际运行结果为准**。为兼容 Node.js 20，`package.json` 的 `scripts.test` 应显式列出测试文件，而不是依赖 Test Runner 展开 glob：
+GitHub Actions 工作流在 **Windows**、Node.js 20 / 22 上运行离线测试（原因见开头兼容性说明：守卫的盘符语义）。**首次 CI 是否通过应以实际运行结果为准**。为兼容 Node.js 20，`package.json` 的 `scripts.test` 应显式列出测试文件，而不是依赖 Test Runner 展开 glob：
 
 ```json
 {
