@@ -2,11 +2,16 @@ name: tests
 
 # The suite is offline by design: no dsh instance, no network, no model quota.
 #
-# Windows only, deliberately. The suite asserts the cwd guard's drive-letter semantics (`D:\x\report.md`
-# is outside `D:\work\p`; `C:\b\pnpm.cmd` beats `C:\b\pnpm.ps1` the way PATHEXT does) because that is the
-# surface this bridge is used on. On a Linux runner those same cases fail for a true reason - the guard
-# does not understand posix paths - so an ubuntu job here would be reporting a portability claim nobody
-# asked for rather than a defect. Supporting posix paths is a separate piece of work, not a CI matrix row.
+# Windows only, deliberately - but no longer for the reason it used to say. The cwd guard now scans by the
+# FLAVOUR OF THE SESSION CWD rather than by the host platform, so posix briefs are classified on Windows
+# too and the posix cases in tests/contract.test.mjs run everywhere (they inject the existence probe, so
+# nothing touches a real /etc).
+#
+# What still keeps this on Windows is the FIXTURES, not the classifier: several tests build workspace
+# paths with path.join and then append Windows-shaped relative parts, and the launcher tests assert
+# PATHEXT ordering (C:\b\pnpm.cmd beats C:\b\pnpm.ps1) which is a Windows-only truth. Running those on
+# ubuntu would report fixture shape as a defect. Turning on an ubuntu leg means making the fixtures
+# flavour-aware first; until then a red ubuntu job would be noise, not a signal.
 on:
   push:
     branches: [main]
