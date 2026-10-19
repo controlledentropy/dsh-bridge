@@ -75,7 +75,12 @@
 
 ## 8. 失败与中止
 
-- 明确要停：`dsh_cancel {alias}`。它返回的 `accepted` 只是受理，要用 `dsh_wait` 复查是否真的落到 `aborted` / `idle`。
+- 明确要停**一轮**：`dsh_cancel {alias}`。它返回的 `accepted` 只是受理，要用 `dsh_wait` 复查是否真的落到 `aborted` / `idle`。这只取消这一轮，**不关进程**。
+- 明确要停**整个 dsh web 实例**：`dsh_stop`（或 `node launch.mjs stop`）。三个字段分工要说清：`ok` 表示**端口真的空出来了**（不是"信号发出去了"），`stopped` 表示记下的那个 pid 确实消失了，`signalSteps` 是实际做过的动作（`taskkill /T` / `process.kill(SIGTERM)` / `taskkill /T /F`）。
+  - 只停本状态目录 `instance.json` 里登记的实例。不是这棵树起的，它**拒绝**并报出端口占用者——杀一个自己没有归属证据的进程是猜，不是停止。确认归属后传 `pid` 显式指定。
+  - 登记的是**死 pid** 时，它清掉过期记录并如实说"什么都没停"，不会把一次空操作报成成功。
+  - 停的是**整棵进程树**：dsh web 会派生子进程（PTY / pwsh / run_code 层），只杀父进程的话子进程还占着端口，下一次 `start` 会撞上端口占用。Windows 用 `taskkill /T`，先优雅后强制；受限环境拿不到 `taskkill` 时只能发原生信号，此时返回里的 `treeKillUnavailable` 会明说"树可能没杀干净"，而 `stillListeningOnPort` 给出证据。
+  - `dryRun:true` 只看不动：报出记下的 pid、它是否活着、端口占用者，不杀任何东西。**"停不下来"和"不知道该停谁"要分开**——前者是真故障，后者是缺信息，处置完全不同。
 - 桥接连不上（`unreachable` / `no launch token` / `/connect -> HTTP …`）属于**环境问题**：先跑 `node launch.mjs doctor`，把它的 `broken` 与 `problems` 原文带回来再决定处置（多半是"没有实例在跑"或"实例的 stdout 没被捕获"）。不要改成自己做然后声称外派过了，也不要凭猜测改配置。
 - 升级 dsh 之后：先 `node launch.mjs check`（不启动进程就能暴露版本不一致与 profile 配置被拒两类问题），再 `doctor`，再 `npm test`，再 `node tools/remote-surface.mjs --check`（方法表漂移），最后**复核 `DSH_ALLOWED_MODELS` 是否仍符合预期**——修复一个配置缺陷可能同时扩大可选模型集。
 - **账本写不进时会明说，不会假装成功。** 每次写 `sessions.json` 都是"读—改—写—读回确认"，被别的进程盖掉就重试。返回 `ledgerAtRisk:true` + `ledgerNote` + `unrecordedRound{alias,requestId,sinceSeq}` 的情况是**任何**写不进：既包括重试仍不确认，也包括盘本身报错（EACCES/ENOSPC/EPERM——2026-10-19 审计实测这类错误原先只抛一句裸错误，句柄拿不到，而派发类调用此时 prompt 已经发出去了）。派发类调用带句柄返回；审计类调用只附带同样字段而**不失败**：`ledgerNote` 会说明两种情况各有哪种含义（"轮次已发出、句柄只有这一份" vs "结论来自 dsh 日志本身、仍然成立，只是账本里那一格的 outcome 旧了"）。看到 `ledgerAtRisk` 就不要把这一轮当作已登记：先把句柄补记，再往下走。

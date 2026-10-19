@@ -29,7 +29,7 @@ import { z } from 'zod';
 import fs from 'node:fs';
 import path from 'node:path';
 import { HOST as LAUNCH_HOST, PORT as LAUNCH_PORT, STATE_DIR as LAUNCH_STATE, OUT_FILE as LAUNCH_OUT,
-  portOpen, tokenFrom, currentToken, start as launchStart } from './launch.mjs';
+  portOpen, tokenFrom, currentToken, start as launchStart, stop as launchStop, status as launchStatus } from './launch.mjs';
 import { ARGS, envelope, authCookie, pastCursor, parseAllowlist, allowedText, checkPolicy, splitModel,
   checkAlias, checkCwd, normCwd, roundRecord, baselineFrom, interpret, modelLabel,
   unwrapProjections, pathsOutsideCwd, pageWindow as calcWindow, permissionHistory, walkRound,
@@ -851,7 +851,7 @@ tool('dsh_sessions', {
 });
 
 tool('dsh_cancel', {
-  description: 'Ask dsh to cancel the in-flight round of an alias. Accepted asynchronously: confirm with dsh_wait, which should then report a settled or idle round.',
+  description: 'Ask dsh to cancel the in-flight round of an alias. Accepted asynchronously: confirm with dsh_wait, which should then report a settled or idle round. This cancels ONE ROUND; it does not stop the dsh web process (that is dsh_stop).',
   inputSchema: { alias: z.string() },
 }, async ({ alias }) => {
   try {
@@ -862,6 +862,42 @@ tool('dsh_cancel', {
     dropListCache();
     return json({ ok: true, alias, sessionId: s.sessionId, accepted: v?.accepted ?? null,
       note: 'accepted is not confirmation; poll dsh_wait for the resulting state' });
+  } catch (e) { return fail(e); }
+});
+
+tool('dsh_stop', {
+  description: 'Stop the dsh web process this bridge spawned (the whole process tree), then report whether the port is actually free. Refuses to kill an instance this state directory did not start unless pid is given explicitly. Nothing in this bridge could stop the instance before, so a wedged UI or a stuck boot had to be ended from Task Manager.',
+  inputSchema: {
+    pid: z.number().int().positive().optional()
+      .describe('stop this pid instead of the one this state directory recorded - only for an instance you started elsewhere and have confirmed'),
+    dryRun: z.boolean().optional().describe('report what would be stopped and who holds the port, without killing anything'),
+  },
+}, async ({ pid, dryRun }) => {
+  try {
+    log({ ev: 'tool', tool: 'dsh_stop', pid: pid || null, dryRun: !!dryRun });
+    const before = await launchStatus();
+    if (dryRun) {
+      return json({ ok: true, dryRun: true, stateDir: before.stateDir, listening: before.listening,
+        recordedPid: before.ownedByUs?.pid ?? null, recordedPidAlive: before.recordedPidAlive ?? null,
+        portHolderPids: before.portHolderPids, portHolderVia: before.portHolderVia,
+        ...(before.portHolderError ? { portHolderError: before.portHolderError } : {}),
+        wouldStop: pid || before.ownedByUs?.pid || null,
+        note: (pid || before.ownedByUs?.pid)
+          ? 'a stop would signal this pid and its children; the port is re-checked afterwards'
+          : 'nothing recorded here to stop - pass pid after confirming the owner with dsh_status' });
+    }
+    const r = await launchStop({ pid: pid || 0 });
+    // The cookie belonged to the process that just went away, and the next tool call must not present it
+    // to whatever is listening next.
+    if (r.stopped || !(await portOpen(CFG.port, CFG.host))) { cookie = ''; dropListCache(); }
+    log({ ev: 'stop', ok: r.ok, stoppedPid: r.stoppedPid ?? null, stillListening: r.stillListening });
+    return json({ ok: r.ok, stateDir: r.stateDir, stoppedPid: r.stoppedPid ?? null, stopped: r.stopped ?? false,
+      wasListening: r.wasListening, stillListening: r.stillListening,
+      stillListeningOnPort: r.stillListeningOnPort ?? [], signalSteps: r.signalSteps ?? [],
+      ...(r.treeKillUnavailable ? { treeKillUnavailable: r.treeKillUnavailable } : {}),
+      ...(r.error ? { error: r.error } : {}), ...(r.hint ? { hint: r.hint } : {}),
+      note: r.note || r.error,
+      ...(r.ok ? { next: 'the next tool call cold-boots a fresh instance (unless DSH_NO_SPAWN=1); transcripts of past rounds stay in the dsh UI' } : {}) });
   } catch (e) { return fail(e); }
 });
 

@@ -15,7 +15,7 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 
 const PKG = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const TOOLS = ['dsh_models', 'dsh_permissions', 'dsh_launch', 'dsh_send', 'dsh_adopt', 'dsh_wait', 'dsh_status', 'dsh_result', 'dsh_sessions', 'dsh_cancel'];
+const TOOLS = ['dsh_models', 'dsh_permissions', 'dsh_launch', 'dsh_send', 'dsh_adopt', 'dsh_wait', 'dsh_status', 'dsh_result', 'dsh_sessions', 'dsh_cancel', 'dsh_stop'];
 
 // A Codex-shaped minimal environment: only what the bridge actually needs, in a throwaway state dir.
 function bridgeEnv(stateDir, extra) {
@@ -119,6 +119,26 @@ test('every pre-flight refusal happens before dsh is touched', async () => {
   } finally { ws.cleanup(); }
 });
 
+test('a parameter the schema rejects never reaches the handler', async () => {
+  // dsh_stop takes a number for pid because a pid is a number. A string is refused by the SDK's own
+  // validation, before any of this code runs - so there is no bridge log entry and no ledger write to
+  // look for. That is the contract: schema errors are protocol errors, not tool failures.
+  const ws = workspace();
+  try {
+    await withBridge(bridgeEnv(ws.state, {}), async (client) => {
+      const r = await client.callTool({ name: 'dsh_stop', arguments: { pid: 'not-a-pid' } });
+      assert.equal(r.isError, true);
+      const text = (r.content || []).map((c) => c.text).join('');
+      assert.match(text, /validation error/i, 'the SDK says what was wrong');
+      // The process start is logged; a tool invocation is not, because none happened.
+      const lines = fs.readFileSync(path.join(ws.state, 'bridge.log.jsonl'), 'utf8').split(/\r?\n/).filter(Boolean).map((l) => JSON.parse(l));
+      assert.deepEqual(lines.filter((l) => l.ev === 'tool'), [], 'the handler never ran, so no tool event was logged');
+      assert.ok(lines.some((l) => l.ev === 'serve'), 'the bridge was up - this is a refusal, not a dead process');
+    });
+    assertNoSideEffects(ws.state);
+  } finally { ws.cleanup(); }
+});
+
 test('a bad default in the config is reported as the config, not as the caller', async () => {
   const ws = workspace();
   try {
@@ -182,3 +202,47 @@ test('a re-dispatch of a brief that is still running is refused, and nothing is 
     assertNoSideEffects(ws.state);
   } finally { ws.cleanup(); }
 });
+
+test('dsh_stop refuses to kill an instance this state directory did not start', async () => {
+  // The whole point of the tool is that it CAN end the instance, so the dangerous half is the default:
+  // with nothing recorded and a closed port there is nothing of ours to stop, and it must say that
+  // rather than guess a pid. dryRun must report the same thing without killing anything.
+  const ws = workspace();
+  fs.mkdirSync(ws.state, { recursive: true });
+  try {
+    await withBridge(bridgeEnv(ws.state, {}), async (client) => {
+      const dry = parsed(await client.callTool({ name: 'dsh_stop', arguments: { dryRun: true } }));
+      assert.equal(dry.ok, true);
+      assert.equal(dry.dryRun, true);
+      assert.equal(dry.listening, false);
+      assert.equal(dry.recordedPid, null);
+      assert.equal(dry.wouldStop, null, 'nothing to stop, and it says so instead of picking a pid');
+
+      const real = await client.callTool({ name: 'dsh_stop', arguments: {} });
+      const body = parsed(real);
+      assert.equal(body.ok, false, 'a stop that stopped nothing is not a success');
+      assert.equal(body.stopped, false);
+      assert.match(String(body.error), /no instance\.json/);
+      assert.equal(fs.existsSync(path.join(ws.state, 'instance.json')), false, 'and it does not invent a record');
+    });
+    assertNoSideEffects(ws.state);
+  } finally { ws.cleanup(); }
+});
+
+test('dsh_stop will not take a recorded-but-dead pid as a stop', async () => {
+  const ws = workspace();
+  fs.mkdirSync(ws.state, { recursive: true });
+  // pid 999999 is not in use on any supported platform; the record is what a crashed boot leaves behind.
+  fs.writeFileSync(path.join(ws.state, 'instance.json'), JSON.stringify({ pid: 999999, port: 3999, version: 'x' }));
+  try {
+    await withBridge(bridgeEnv(ws.state, {}), async (client) => {
+      const body = parsed(await client.callTool({ name: 'dsh_stop', arguments: {} }));
+      assert.equal(body.ok, false);
+      assert.equal(body.stopped, false);
+      assert.match(String(body.error), /process is gone/, 'a dead pid is reported, not reported as stopped');
+      assert.equal(fs.existsSync(path.join(ws.state, 'instance.json')), false, 'the stale record is cleared');
+    });
+    assertNoSideEffects(ws.state);
+  } finally { ws.cleanup(); }
+});
+
