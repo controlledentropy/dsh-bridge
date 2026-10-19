@@ -30,6 +30,69 @@ const NPM_ROOT = process.env.APPDATA ? path.join(process.env.APPDATA, 'npm', 'no
 
 function mkdirs() { fs.mkdirSync(STATE_DIR, { recursive: true }); fs.mkdirSync(RUN_DIR, { recursive: true }); }
 
+/* ------------------------------------------------------------------ the instance's own environment */
+// An instance outlives the shell that cold-booted it, and the dsh UI shells out to whatever that
+// environment carried. MEASURED: installing a plugin runs `pnpm` (dsh's own failure text is "pnpm was
+// not found"), and pnpm lives in %APPDATA%\npm - which the interactive user has on PATH while the agent
+// shell that happened to start the instance did not. The instance then looked perfectly healthy
+// (`/api` answered, rounds completed) and only plugin install failed, hours later. So the child PATH is
+// built here rather than inherited by accident.
+const normDir = (d) => String(d).replace(/[\\/]+$/, '').toLowerCase();
+export function npmGlobalBinDir(env = process.env) {
+  return env.APPDATA ? path.join(env.APPDATA, 'npm') : '';
+}
+export function childPath(env = process.env, extra = []) {
+  const base = String(env.PATH || '');
+  const have = new Set(base.split(path.delimiter).filter(Boolean).map(normDir));
+  // Trimmed: `DSH_EXTRA_PATH="a, b"` is written by a human, and a leading space becomes a directory that
+  // no executable lives in - silently shifting every later lookup one notch.
+  const dirs = [...new Set([npmGlobalBinDir(env), ...extra].map((d) => String(d || '').trim()).filter(Boolean))];
+  const added = dirs.filter((d) => !have.has(normDir(d)));
+  return { path: [...added, base].filter(Boolean).join(path.delimiter), added };
+}
+// Resolved against the PATH the CHILD will see, so this describes the instance, not this script's shell.
+export function resolveToolchain(pathStr, exists = (p) => fs.existsSync(p), platform = process.platform) {
+  const exts = platform === 'win32' ? ['.cmd', '.exe', '.ps1', ''] : [''];
+  const out = {};
+  for (const tool of ['node', 'npm', 'pnpm', 'git']) {
+    out[tool] = null;
+    for (const dir of String(pathStr || '').split(path.delimiter)) {
+      if (!dir) continue;
+      for (const e of exts) {
+        const p = path.join(dir, tool + e);
+        if (exists(p)) { out[tool] = p; break; }
+      }
+      if (out[tool]) break;
+    }
+  }
+  return out;
+}
+export function toolchainProblems(tc) {
+  if (!tc) return ['instance.json predates toolchain reporting: whether this instance can see pnpm/npm/git is unknown. `node launch.mjs stop` then `start` to record it.'];
+  const missing = Object.entries(tc).filter(([, v]) => !v).map(([k]) => k);
+  if (!missing.length) return [];
+  if (missing.includes('pnpm')) return ['this instance cannot see pnpm on its own PATH, so installing a plugin from the dsh UI will fail ("pnpm was not found"). Set DSH_EXTRA_PATH=<dir containing pnpm> and restart it (stop, then start), or start it from a shell where pnpm resolves.'];
+  return ['this instance cannot see ' + missing.join(', ') + ' on its own PATH; anything the UI shells out to will fail the same way'];
+}
+
+// Which pid listens on the port - read from netstat, parsed as a pure step so it is testable offline.
+export function parseNetstatListeners(text, port) {
+  const pids = new Set();
+  for (const line of String(text || '').split(/\r?\n/)) {
+    const cols = line.trim().split(/\s+/);
+    if (!/LISTENING/i.test(line) || cols.length < 4 || !cols[1].endsWith(':' + port)) continue;
+    const pid = Number(cols[cols.length - 1]);
+    if (Number.isFinite(pid) && pid > 0) pids.add(pid);
+  }
+  return [...pids];
+}
+export function portHolderPids(port = PORT) {
+  if (process.platform !== 'win32') return [];
+  try { return parseNetstatListeners(execFileSync('netstat', ['-ano', '-p', 'tcp'], { encoding: 'utf8' }), port); }
+  catch { return []; }
+}
+const alive = (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+
 // Captured stdout may be UTF-8 or UTF-16 depending on how the redirect was done.
 export function readTextSmart(file) {
   try {
@@ -177,7 +240,22 @@ export async function status() {
   const open = await portOpen();
   let mine = null;
   try { mine = JSON.parse(fs.readFileSync(INSTANCE, 'utf8')); } catch {}
-  return { port: PORT, host: HOST, listening: open, tokenCaptured: !!currentToken(), captureFile: OUT_FILE, ownedByUs: mine };
+  const holders = portHolderPids();
+  const out = { stateDir: STATE_DIR, host: HOST, port: PORT, listening: open, tokenCaptured: !!currentToken(),
+    captureFile: OUT_FILE, ownedByUs: mine, portHolderPids: holders };
+  if (open && mine?.pid) {
+    out.recordedPidAlive = alive(mine.pid);
+    out.holderIsOurs = holders.includes(mine.pid);
+    // The instance's environment, not this shell's - this is the line that says whether the UI can
+    // install a plugin, run git, or spawn anything at all.
+    out.toolchain = mine.toolchain ?? null;
+    out.problems = toolchainProblems(mine.toolchain);
+  } else if (open && !mine?.pid) {
+    out.problems = ['something listens on ' + HOST + ':' + PORT + ' but this state directory did not record starting it'
+      + (holders.length ? ' (listener pid ' + holders.join('/') + ')' : '')
+      + '. Stop it from the tree that owns it, or confirm the pid and use `node launch.mjs stop --pid <pid>`.'];
+  }
+  return out;
 }
 
 function takeSpawnLock() {
@@ -204,21 +282,28 @@ export async function start({ quiet = false } = {}) {
     if (fatal.length) return { ok: false, error: 'pre-flight failed: ' + fatal.join(' | ') };
     mkdirs();
     const fd = fs.openSync(OUT_FILE, 'w');
+    const cp = childPath(process.env, String(process.env.DSH_EXTRA_PATH || '').split(path.delimiter));
+    const toolchain = resolveToolchain(cp.path);
     let pid = 0;
     try {
       const child = spawn(c.node, [c.cli, '--profile', 'web', '--host', HOST, '--port', String(PORT), '--no-open'], {
         cwd: RUN_DIR, detached: true, stdio: ['ignore', fd, fd], windowsHide: true,
+        env: { ...process.env, PATH: cp.path },
       });
       pid = child.pid; child.unref();
     } finally { fs.closeSync(fd); }                       // the child keeps its own handle; don't leak ours
     try { fs.chmodSync(OUT_FILE, 0o600); } catch {}        // captured file holds an owner-level bearer token
-    fs.writeFileSync(INSTANCE, JSON.stringify({ pid, port: PORT, version: c.version, startedAt: new Date().toISOString() }, null, 2));
+    fs.writeFileSync(INSTANCE, JSON.stringify({ pid, port: PORT, version: c.version, startedAt: new Date().toISOString(),
+      pathAdded: cp.added, toolchain }, null, 2));
+    const bootProblems = toolchainProblems(toolchain);
     const deadline = Date.now() + Number(process.env.DSH_BOOT_TIMEOUT_MS || 90000);
     while (Date.now() < deadline) {
       await new Promise((r) => setTimeout(r, 1500));
       if (tokenFrom(OUT_FILE) && (await portOpen())) {
-        if (!quiet) console.log('dsh web up: pid ' + pid + ' version ' + c.version + '\nURL with token: ' + OUT_FILE);
-        return { ok: true, pid, version: c.version, notes: c.problems.filter((p) => p.startsWith('composition note')) };
+        if (!quiet) console.log('dsh web up: pid ' + pid + ' version ' + c.version + '\nURL with token: ' + OUT_FILE
+          + (bootProblems.length ? '\nWARNING: ' + bootProblems.join('\nWARNING: ') : ''));
+        return { ok: true, pid, version: c.version, toolchain, pathAdded: cp.added,
+          problems: bootProblems, notes: c.problems.filter((p) => p.startsWith('composition note')) };
       }
     }
     return { ok: false, error: 'instance did not become ready within the boot timeout; see ' + OUT_FILE };
@@ -233,14 +318,33 @@ export async function start({ quiet = false } = {}) {
   return { ok: false, error: 'timed out waiting for the other process to bring dsh web up (lock held by pid ' + (lock.holder || '?') + ')' };
 }
 
-export async function stop() {
+export async function stop({ pid: confirmed = 0 } = {}) {
+  const looked = { stateDir: STATE_DIR, instanceFile: INSTANCE };
   let mine = null;
   try { mine = JSON.parse(fs.readFileSync(INSTANCE, 'utf8')); } catch {}
-  if (!mine?.pid) return { ok: false, error: 'no instance.json: we did not start this instance, so we will not kill a process we do not own' };
-  try { process.kill(mine.pid); } catch (e) { return { ok: false, error: 'kill failed: ' + e.message }; }
+  const holders = portHolderPids();
+  const target = mine?.pid || confirmed;
+  // Two trees, two state directories: run this from the one that did not boot the instance and the old
+  // message read like "there is no way to stop it". It is not the bridge's process to kill on a guess,
+  // so say who holds the port and take the pid from a human who confirmed it.
+  if (!target) {
+    return { ok: false, ...looked, portHolderPids: holders,
+      error: 'no instance.json here, so this tree did not start whatever holds ' + HOST + ':' + PORT
+        + ' - killing a process the bridge does not own is a guess, not a stop',
+      hint: holders.length ? 'confirm it is yours, then: node launch.mjs stop --pid ' + holders[0] : 'nothing is listening on the port' };
+  }
+  if (mine?.pid && confirmed && confirmed !== mine.pid) {
+    return { ok: false, ...looked, error: 'this tree recorded pid ' + mine.pid + ' but you asked to stop ' + confirmed + ' - check `node launch.mjs status` first' };
+  }
+  try { process.kill(target); }
+  catch (e) { return { ok: false, ...looked, stoppedPid: null, error: 'kill failed: ' + e.message, portHolderPids: portHolderPids() }; }
   await new Promise((r) => setTimeout(r, 1500));
   try { fs.rmSync(SPAWN_LOCK, { force: true }); } catch {}
-  return { ok: !(await portOpen()), stoppedPid: mine.pid };
+  try { fs.rmSync(INSTANCE, { force: true }); } catch {}   // the process is gone; a stale record would make the next start refuse
+  const still = portHolderPids();
+  return { ok: still.length === 0 && !(await portOpen()), stoppedPid: target, stillListeningOnPort: still,
+    note: still.length ? 'pid ' + still.join('/') + ' still holds ' + PORT + ': it is not the process we stopped, or a child of it survived'
+      : 'port ' + PORT + ' is free' };
 }
 
 // Windows: fs.chmodSync(0o600) does nothing - POSIX mode bits are not enforced there (measured: the
@@ -312,6 +416,13 @@ export async function doctor() {
   // inherits. Say who can actually read it instead of implying an assurance the OS does not give.
   out.acl = tokenAcl();
   if (out.acl.concerns?.length) out.env.problems.push(...out.acl.concerns.map((x) => `token file ACL: ${x}`));
+  // The instance's own PATH is what the dsh UI shells out to later: a plugin install runs pnpm there, and
+  // nothing else in this report would show that it cannot.
+  if (st.listening) {
+    out.instance = { pid: st.ownedByUs?.pid ?? null, holderPids: st.portHolderPids, toolchain: st.toolchain ?? null,
+      holderIsOurs: st.holderIsOurs ?? null };
+    if (st.problems?.length) out.env.problems.push(...st.problems);
+  }
   if (st.listening && out.tokenCaptured) {
     try {
       const r = await fetch(`http://${HOST}:${PORT}/connect?token=${currentToken()}&interactions=answer`, { redirect: 'manual', signal: AbortSignal.timeout(8000) });
@@ -344,11 +455,12 @@ export async function doctor() {
 
 if (process.argv[1] && process.argv[1].endsWith('launch.mjs')) {
   const cmd = process.argv[2] || 'resolve';
+  const flag = (name) => { const i = process.argv.indexOf(name); return i > -1 ? process.argv[i + 1] : ''; };
   const out = cmd === 'check' ? await check({ refresh: true })
     : cmd === 'status' ? await status()
     : cmd === 'doctor' ? await doctor()
     : cmd === 'start' ? await start()
-    : cmd === 'stop' ? await stop()
+    : cmd === 'stop' ? await stop({ pid: Number(flag('--pid')) || 0 })
     : cmd === 'lock-acl' ? lockTokenAcl(process.argv[3] || OUT_FILE)
     : resolveDsh();
   console.log(JSON.stringify(out, null, 1));

@@ -254,6 +254,7 @@ dsh_status {alias}                 查看模型、token 用量和上下文压力
 | `DSH_NO_SPAWN` | 空 | 设为 `1` 后禁止桥接自动启动 `dsh web` |
 | `DSH_AUTO_GROUP` | 空 | 设为 `0` 时默认关闭自动侧边栏分栏；单次调用还可设置 `group: false` |
 | `DSH_NODE` / `DSH_PKG_DIR` | 自动探测 | 覆盖 Node 可执行文件和 `@deepseek-ai/dsh` 包目录 |
+| `DSH_EXTRA_PATH` | 空 | 追加到**实例进程** PATH 前面的目录（分隔符拼接）。npm 全局 bin 目录已经自动补上；当 `pnpm`/`git` 装在别处、而 dsh 的 UI 要用它们时（安装插件、git 类操作），用这个变量指过去。取值以启动 `launch.mjs start` 的那个环境为准 |
 
 ### 模型访问策略
 
@@ -312,7 +313,9 @@ DSH_NO_SPAWN = '1'
 - [ ] 所有下发任务使用可写、可回滚的工作区，并由调用方审查结果。
 - [ ] 变更 `dsh` 版本、profile 或 MCP 配置后，重新运行预检和连通性验证。
 
-`node launch.mjs stop` **只尝试停止** `instance.json` 中登记的进程，不会停止不属于桥接管理的其他实例。对于外部管理的 `dsh web`，请通过对应的进程管理方式停止。
+**停止实例只看一件事：谁登记的。** `node launch.mjs stop` 只停止**本状态目录**的 `instance.json` 里登记的进程。两份源码树各有自己的 `.state`，从没启动过它的那一棵执行 `stop`，会明确告诉你"这里没有 instance.json"并给出**当前占用端口的 pid**——它不会替你猜着杀别人的进程。确认那个 pid 就是你的实例后，用 `node launch.mjs stop --pid <pid>` 显式停止；外部用别的方式管理的 `dsh web` 请照原方式停止。`node launch.mjs status` 会一次报出：状态目录、端口是否有人监听、我们登记的 pid 是否还活着、端口占用者是不是它。
+
+**实例能做什么，取决于启动它的那个环境。** `dsh web` 一旦冷启动就活得比那个 shell 久，而 dsh 的 UI 之后是**拿着它自己的 PATH 去外部执行程序**的。实测踩过的坑：安装插件要 `pnpm`（dsh 自己的报错文案是 `pnpm was not found`），`pnpm` 装在 `%APPDATA%\npm`，交互式登录 shell 的 PATH 里有、而代理/Codex 侧那个 shell 里没有——于是这个实例看起来完全健康（`/api` 正常应答、任务正常跑完），只有装插件失败。现在 `launch.mjs` **显式拼子进程 PATH**（补上 npm 全局 bin 目录，可用 `DSH_EXTRA_PATH` 追加），并把实例实际能看到的 `node/npm/pnpm/git` 绝对路径记进 `instance.json`；`status`/`doctor` 会直接说"这个实例看不到 pnpm，装插件会失败"，以及怎么办。旧的 `instance.json` 里没有这项记录时会如实报 unknown，而不是报好。
 
 ## 测试与调试
 
@@ -321,9 +324,11 @@ DSH_NO_SPAWN = '1'
 ```bash
 node launch.mjs resolve     # 解析 Node / dsh 入口 / 版本
 node launch.mjs check       # 会运行一次 dsh CLI 配置检查；不启动 dsh web 服务
-node launch.mjs doctor      # 体检：端口、token、鉴权、模型目录等
-node launch.mjs start       # 已运行则连接，否则预检后启动并捕获 stdout
-node launch.mjs stop        # 仅停止桥接记录为自己管理的实例
+node launch.mjs doctor      # 体检：端口、token、鉴权、模型目录、实例可见的工具链、token 文件 ACL
+node launch.mjs status      # 状态目录 / 端口监听 / 登记的 pid / 占用端口的 pid / 实例工具链
+node launch.mjs start       # 已运行则连接，否则预检后启动，显式构造子进程环境并捕获 stdout
+node launch.mjs stop        # 停止本状态目录登记的实例；不是自己起的就只报端口占用者
+node launch.mjs stop --pid 12345   # 人工确认后的显式停止
 ```
 
 ### 契约测试与诊断工具
