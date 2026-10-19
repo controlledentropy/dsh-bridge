@@ -32,7 +32,7 @@ import { HOST as LAUNCH_HOST, PORT as LAUNCH_PORT, STATE_DIR as LAUNCH_STATE, OU
 import { ARGS, envelope, authCookie, pastCursor, parseAllowlist, allowedText, checkPolicy, splitModel,
   checkAlias, checkCwd, normCwd, roundRecord, baselineFrom, interpret, modelLabel,
   unwrapProjections, pathsOutsideCwd, pageWindow as calcWindow, permissionHistory, walkRound,
-  approvalState, verdictFields, PAGE_SIZE, MAX_PAGES } from './lib/api-contract.mjs';
+  approvalState, verdictFields, humanWaits, modelEfforts, PAGE_SIZE, MAX_PAGES } from './lib/api-contract.mjs';
 
 const num = (name, value, fallback) => {
   const n = Number(value);
@@ -348,13 +348,24 @@ async function readRound(s, opts = {}) {
   const p = opts.p ?? await projections(s.sessionId).catch(() => null);
   const r = interpret(events, row?.running ?? null);
   const ap = approvalState(events);
+  // Human waits are looked for in the newest events, not the round's first page: an ask_user_question
+  // dispatch sits at the end of a live log, while the cheap poll reads its beginning. The union is used
+  // only for this scan - the verdict still comes from `events` alone, so the next round's turn/end
+  // cannot leak into state even though the tail is read.
+  const tail = settledHint ? [] : (await pageTail(s.sessionId, 40).catch(() => ({ events: [] }))).events;
+  const scan = [...new Map([...events, ...tail].map((e) => [e?.seq, e])).values()].sort((a, b) => a.seq - b.seq);
+  const hw = humanWaits(scan, p?.userQuestions?.active || []);
   const v = verdictFields(r, window);
-  // Waiting on a human outranks every other reading of this round: it explains why nothing is moving
-  // and what would unblock it.
-  if (!r.settled && ap.pending.length) {
-    v.note = `waiting on ${ap.pending.length} unanswered approval(s) - ${ap.pending.map((x) => x.toolName).join(', ')}; an unattended dispatch cannot proceed until a human answers in the dsh UI`;
+  // A round parked on a person outranks every other reading of it, and there are two ways to be parked:
+  // an approval queue entry, or an unanswered ask_user_question riding a PTC dispatch. Watching only the
+  // first reported a 102-second human wait as "still running".
+  if (!r.settled && (ap.pending.length || hw.asked.length)) {
+    const bits = [];
+    if (ap.pending.length) bits.push(`${ap.pending.length} approval(s): ${ap.pending.map((x) => x.toolName).join(', ')}`);
+    if (hw.asked.length) bits.push(`${hw.asked.length} question(s): ${hw.asked.map((w) => (w.questions?.[0]?.header || w.name)).join(', ')}`);
+    v.note = `waiting on a human - ${bits.join(' ; ')}; an unattended dispatch cannot proceed until someone answers in the dsh UI`;
   }
-  return { ...r, ...ap, window, ...v,
+  return { ...r, ...ap, ...hw, window, ...v,
     model: modelLabel(p?.modelSelection?.lastUsed || lastRound(s).pinned || s.pinned),
     tokenUsage: p?.tokenUsage || null, contextPressure: p?.contextPressure || null };
 }
@@ -410,7 +421,21 @@ async function awaitCatalog(provider, budgetMs) {
 // `want` is the already-validated spec from assertModelAllowed, or null when nothing is pinned.
 async function pinModel(sessionId, want) {
   if (!want) return null;
-  await awaitCatalog(want.provider, CFG.catalogMs);
+  const cat = await awaitCatalog(want.provider, CFG.catalogMs);
+  // MEASURED: the catalog declares each model's own efforts (qoder/qfmodel accepts low|medium and rejects
+  // minimal|high|max; workbuddy/deepseek-v4.1-flash accepts low and max). Checking them here means an
+  // unsupported effort is refused with the declared list attached, instead of the caller discovering
+  // legality by calling selectModel - which is a WRITE: an accepted call moves modelSelection.next.
+  if (want.effort) {
+    const group = (cat?.groups || []).find((g) => (g.id || g.name || g.provider) === want.provider);
+    const row = (group?.models || []).find((m) => (m.id || m.model) === want.model);
+    const { efforts, defaultEffort } = modelEfforts(row);
+    if (efforts && !efforts.includes(want.effort)) {
+      const err = new Error(`model "${want.provider}/${want.model}" does not support reasoning effort "${want.effort}" (declared: ${efforts.join(', ')}${defaultEffort ? `, default: ${defaultEffort}` : ''})`);
+      err.detail = { provider: want.provider, model: want.model, requested: want.effort, declared: efforts, defaultEffort };
+      throw err;
+    }
+  }
   const v = await call('session/selectModel', ARGS.sessionSelectModel({
     sessionId, provider: want.provider, model: want.model, reasoningEffort: want.effort }));
   log({ ev: 'pin', sessionId, selected: v?.selected });
@@ -491,8 +516,9 @@ tool('dsh_models', {
     for (const g of cat?.groups || []) for (const m of (g.models || [])) {
       const provider = g.provider || g.id || g.name;
       const name = m.id || m.model;
+      const { efforts, defaultEffort, descriptions } = modelEfforts(m);
       rows.push({ provider, model: name, label: m.label || m.name || null,
-        efforts: m.reasoningEfforts || m.efforts || null, permitted: !checkPolicy(ALLOW, provider, name, null) });
+        efforts, defaultEffort, effortHelp: descriptions, permitted: !checkPolicy(ALLOW, provider, name, null) });
     }
     return json({ ok: true, policy: ALLOW ? allowedText(ALLOW) : '(unrestricted)', default: cat?.default || null,
       configuredDefaults: { model: CFG.defaultModel || null, effort: CFG.defaultEffort || null },
@@ -648,9 +674,10 @@ tool('dsh_wait', {
     // this round's own. Forcing the cheap pass here reported a COMPLETED round as "idle" (measured
     // 2026-10-18: verdict at seq 1084, window stopped at 28) - and "idle" reads as "never dispatched".
     let r = await readRound(s);                           // answer at once if it already settled
-    // Waiting cannot help while dsh is asking a human something: return the question instead of
-    // burning the whole window and reporting "running".
-    while (!r.settled && r.state !== 'idle' && !(r.pending || []).length && Date.now() - started + CFG.pollMs < maxSeconds * 1000) {
+    // Waiting cannot help while dsh is asking a human something - an approval or an unanswered question:
+    // return the ask instead of burning the whole window reporting "running".
+    while (!r.settled && r.state !== 'idle' && !(r.pending || []).length && !r.waitingOnHuman
+      && Date.now() - started + CFG.pollMs < maxSeconds * 1000) {
       await sleep(CFG.pollMs);
       r = await readRound(s);
     }

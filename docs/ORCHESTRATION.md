@@ -42,7 +42,8 @@
 - `verdictComplete` 只有一个含义：**本轮自己的 `turn/end` 已经读到**（等价于 `settled`）。它不与窗口覆盖度做或运算——正在正常执行、日志恰好读完的一轮，`verdictComplete` 必须是 `false`。
 - 落不到判决时区分两种情况：`windowTruncated:true` = **还没读到日志末尾**，别下结论，用 `dsh_result` 重读；`logExhausted:true` 且 `state:"idle"` = **日志已到末尾而本轮没有 `turn/start`/`turn/end`**，即派单没有被接手，按未验证处理。
 - `abortReason:"user"` 表示是人中止的（通常就是编排方自己调了 `dsh_cancel`），不是 dsh 放弃；两者处置完全不同。
-- `pending` 非空表示**本轮停在人工审批上**，`dsh_wait` 会立刻返回而不是耗完窗口。无人值守时它不会自己好：要么让人去 dsh UI 回答，要么把会话档位提到 `danger-full-access`（审批策略随之变 `never`）再重发。**不要**继续 `dsh_wait` 空转，也不要把它当成 dsh 卡死。
+- `pending` 非空表示**本轮停在人工审批上**，`waitingOnHuman:true` + `asked[]` 表示**停在待人回答的提问上**（`ask_user_question` 走 PTC 分发，不产生审批事件）。两种都不会自己好：`dsh_wait` 一发现就立即返回（实测 50 ms），要么人去 dsh UI 回答，要么提权到 `danger-full-access`（审批策略随之变 `never`）后重发。**不要**继续 `dsh_wait` 空转，也不要把它当成 dsh 卡死。
+- 无人值守的任务包里应显式禁止提问（"不要向我提问；有歧义就按最保守解释做，并把假设写进报告"），否则一轮会停在 `ask_user_question` 上等人——实测那次停了 102 秒。
 - 单次 `dsh_wait` 不要超过客户端的 `tool_timeout_sec`（默认建议 45s）；没落定就继续调用，而不是一次拉长。
 - `dsh_wait` / `dsh_result` 默认只回本轮内容；历史轮次要显式 `dsh_result {round:N, messages:N}`。
 

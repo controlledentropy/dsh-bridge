@@ -12,7 +12,7 @@ import { fileURLToPath } from 'node:url';
 import { ARGS, envelope, authCookie, pastCursor, parseAllowlist, allowedText, checkPolicy, splitModel,
   modelLabel, ALIAS_RE, checkAlias, checkCwd, normCwd, roundRecord, baselineFrom, interpret, argText,
   unwrapProjections, pathsOutsideCwd, pageWindow, sliceRound, permissionHistory, approvalState,
-  walkRound, verdictFields } from '../lib/api-contract.mjs';
+  walkRound, verdictFields, humanWaits, modelEfforts } from '../lib/api-contract.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const PKG = path.resolve(HERE, '..');
@@ -399,4 +399,42 @@ test('walkRound honours walk:false and the page cap', async () => {
   assert.equal(capped.window.pages, 2, 'an unsettled round cannot page forever');
   assert.equal(capped.window.truncated, true);
   assert.equal(interpret(capped.events, false).state, 'idle', 'no turn/end means no verdict, whatever the flag says');
+});
+
+test('humanWaits sees the question wait that approvals do not', () => {
+  // MEASURED shapes from a live ptc session: ask_user_question is not directly callable (UNKNOWN_TOOL),
+  // run_code dispatches it, and the human wait is the gap between these two events.
+  const start = { seq: 32, type: 'tool/ptc-dispatch-start', time: 1000, data: {
+    rootCallId: 'c1', parentCallId: 'c1', subCallId: 'c1:ptc:1', name: 'ask_user_question',
+    arguments: { questions: [{ id: 'probe_choice', header: '探针选择', question: '跑 A 还是 B？',
+      options: [{ label: 'A（只读目录列表）' }, { label: 'B（跳过）' }] }] } } };
+  const done = { seq: 33, type: 'tool/ptc-dispatch', time: 102000, data: { subCallId: 'c1:ptc:1', name: 'ask_user_question',
+    isError: false, content: [{ type: 'text', text: '{"answers":[{"id":"probe_choice","selected":["A（只读目录列表）"]}]}' }] } };
+  assert.deepEqual(humanWaits([start, done]).waitingOnHuman, false, 'answered question is not a wait');
+  const open = humanWaits([start]);
+  assert.equal(open.waitingOnHuman, true, 'unanswered question IS a wait, and approvals never show it');
+  assert.equal(open.asked[0].questions[0].header, '探针选择', 'the note can name what is being asked');
+  assert.deepEqual(open.asked[0].questions[0].options, ['A（只读目录列表）', 'B（跳过）']);
+  // A long-running shell dispatch is work in progress, not a blocked round.
+  assert.equal(humanWaits([{ seq: 5, type: 'tool/ptc-dispatch-start', data: { subCallId: 's:ptc:1', name: 'shell', arguments: {} } }]).waitingOnHuman, false);
+  assert.equal(humanWaits([], [{ id: 'q1', question: 'which one?', options: [{ label: 'x' }] }]).waitingOnHuman, true,
+    'the userQuestions projection path counts too');
+  assert.deepEqual(humanWaits(null, null).humanWaits, []);
+});
+
+test('modelEfforts reads the declared efforts instead of probing selectModel', () => {
+  // MEASURED: groups are {id,name,models[]}; each model declares reasoning.efforts[] + defaultEffort.
+  const flash = { id: 'deepseek-flash', name: 'DeepSeek-V4.1-Flash', reasoning: { efforts: [
+    { id: 'off', name: 'Off', description: 'Use for simple tasks that do not need reasoning.' },
+    { id: 'low', name: 'Low', description: 'Prefer for routine or latency-sensitive tasks.' },
+    { id: 'max', name: 'Max', description: 'Reserve for the hardest quality-first tasks.' }], defaultEffort: 'high' } };
+  const e = modelEfforts(flash);
+  assert.deepEqual(e.efforts, ['off', 'low', 'max']);
+  assert.equal(e.defaultEffort, 'high');
+  assert.equal(e.descriptions.low, 'Prefer for routine or latency-sensitive tasks.');
+  assert.deepEqual(modelEfforts({ id: 'x' }), { efforts: null, defaultEffort: null, descriptions: null },
+    'an undeclared list stays unknown rather than becoming "anything goes"');
+  assert.deepEqual(modelEfforts({ id: 'y', reasoning: { efforts: ['low', 'max'] }, })
+    .efforts, ['low', 'max'], 'a bare string list is accepted too');
+  assert.equal(modelEfforts(null).efforts, null);
 });

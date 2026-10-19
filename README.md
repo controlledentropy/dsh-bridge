@@ -206,12 +206,12 @@ dsh_status {alias}                 查看模型、token 用量和上下文压力
 
 | 工具 | 主要参数 | 作用 |
 | --- | --- | --- |
-| `dsh_models` | 无 | 返回实时模型目录与允许清单的交集，包含默认模型、可路由 provider 和加载失败信息 |
+| `dsh_models` | 无 | 返回实时模型目录与允许清单的交集，包含默认模型、可路由 provider、加载失败信息，以及**每个模型自己声明的 `efforts` / `defaultEffort`**（例如 `qoder/qfmodel` 只有 `low/medium/xhigh`，没有 `max`；不声明的如实报 `null`）。选 `reasoningEffort` 前读它，不要用 `selectModel` 试探——那是写操作 |
 | `dsh_permissions` | 可选 `alias` | **只读**查看沙箱面：dsh 提供的档位（`read-only` / `workspace-write` / `danger-full-access`）、实例默认档位；给了 `alias` 还会返回该会话的生效档位与变更史（`escalated`、`escalatedBy`、`approvals`）。**运行中的会话改不了沙箱档位**：dsh 随包方法表里没有 per-session 的档位写入口（`permissionPresets/set`、`session/setSandboxMode` 都不存在），只能在 dsh UI 里由人操作。`agentPresets/select` 存在但只对**首轮之前**的会话生效，`terminal/create` 的官方描述明示绕过 Agent 沙箱与审批——桥接刻意都不调用，理由见 [docs/REMOTE-SURFACE.md](docs/REMOTE-SURFACE.md) |
 | `dsh_launch` | `alias`, `cwd`, `task`; 可选 `phase`, `group`, `dryRun`, `allowOutsideCwd`, `model`, `reasoningEffort` | 新建命名会话、设置模型并提交第一轮；`dryRun` 只创建会话，不执行任务。任务被判定为**向工作区外写入**时在下发前拒绝，只读提及外部路径不拦 |
 | `dsh_send` | `alias`, `task`; 可选 `allowOutsideCwd`, `model`, `reasoningEffort` | 向同一会话提交下一轮（同一阶段返工用它，新阶段用新 `alias`） |
 | `dsh_adopt` | `alias`, `sessionId`, `cwd`; 可选 `phase` 等 | 接管已存在的 `dsh web` 会话，不改变其分栏 |
-| `dsh_wait` | `alias`; 可选 `maxSeconds`（≤ 45） | 在限定时间内等待本轮完成；返回本轮自己的判决（`state` / `verdictComplete`），若本轮停在人工审批上则立即返回 `pending[]` 而不空等 |
+| `dsh_wait` | `alias`; 可选 `maxSeconds`（≤ 45） | 在限定时间内等待本轮完成；返回本轮自己的判决（`state` / `verdictComplete`）。**本轮停在人身上时立即返回**（实测 50 ms）：审批看 `pending[]`，待人回答的提问看 `waitingOnHuman` / `asked[]`（含问题与选项） |
 | `dsh_status` | `alias` | 返回本轮状态、模型、token 用量、上下文压力、待答问题，以及会话边界信息：`workingDirectory`、`sandbox`（如 `workspace-write`）、`agentPreset`、`approvalPolicy` / `unattended`（能否无人值守）、`sessionStats` |
 | `dsh_result` | `alias`; 可选 `messages`（首页事件数，≤ 1000）、`round` | 获取某一轮（默认最新一轮）的验收载荷：**该轮全部**助手文本、工具调用、落盘文件、`toolErrors[]`（含失败正文与错误码）、`sandboxDenials`、`window` / `windowTruncated` / `verdictComplete` / `logExhausted`。`messages` 只影响首页大小，不影响完整性 |
 | `dsh_sessions` | 可选 `cwd` | 查看桥接持有的别名；传入 `cwd` 时额外查询该工作区的活会话 |
@@ -373,6 +373,7 @@ GitHub Actions 工作流配置在 Linux / Windows、Node.js 20 / 22 上运行离
 | MCP 客户端面板未显示工具 | 某些客户端不会展示完整工具列表 | 尝试直接调用 `dsh_models`，查看 `bridge.log.jsonl` 中的 `ev:"tool"` |
 | 返回 `idle` 或 `accepted: true` | 还没有可确认的完成记录 | 继续查询状态；绝不据此宣称任务完成 |
 | 一轮长时间 `running` 却毫无进展，或 `dsh_wait` 返回的 `pending` 非空 | 会话审批策略是 `ask`，某个操作停在人工确认上（实测 `pwsh` / git 会触发），而 `session/list.running` 仍是 `true` | 到 dsh UI 回答该审批，或把会话档位提到 `danger-full-access`（策略随之变 `never`）后重发；继续 `dsh_wait` 不会有人来点。派单前先看 `dsh_status` 的 `unattended` |
+| 轮次卡住但 `pending` 是空的、也没有审批事件 | 执行者在等**人回答它的提问**：`ask_user_question` 经 `run_code` 走 PTC 分发，表现为未闭合的 `tool/ptc-dispatch-start`（实测 102 秒），不产生任何审批事件 | 看 `dsh_wait` 返回的 `waitingOnHuman` / `asked[]`（含问题与选项），由人去 UI 回答；或在任务包里显式禁止提问，让执行者按最保守解释继续 |
 | `sandboxDenials > 0`、正文出现 `file access denied` / `EPERM` | 任务要写的目录在会话工作区之外 | 以目标目录为 `cwd` 重开会话；不要指望"提权重试"提示，无人值守时没人能批准 |
 | `run_code` 报 `ENOENT …\undefined\temp\…` 或写 `%TEMP%` 报 `EPERM` | dsh 的 `run_code` 会清空进程环境，`os.tmpdir()` 因此拼出相对路径；写真实 TEMP 又被沙箱拒绝 | 任务包里显式规定临时文件写在会话工作区内的绝对路径 |
 | 子进程"没有输出也没有退出码"（例如 git 明明装了） | 宿主环境 `PATHEXT` 不含 `.EXE`（打包应用的子进程环境可能不是注册表那份），PowerShell 会静默不启动 | `node launch.mjs doctor` 的 `env.problems` 会直接报出来；对比注册表 `Session Manager\Environment` 的值 |
