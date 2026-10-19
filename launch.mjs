@@ -4,7 +4,7 @@
 // only break one place. Every path is resolved or overridable; nothing here hardcodes a package's
 // internal file layout.
 //
-//   node launch.mjs resolve | check | status | start | stop | doctor | lock-acl
+//   node launch.mjs resolve | check | status | start | stop | restart | doctor | lock-acl
 import fs from 'node:fs';
 import path from 'path';
 import { fileURLToPath } from 'node:url';
@@ -86,12 +86,98 @@ export function parseNetstatListeners(text, port) {
   }
   return [...pids];
 }
-export function portHolderPids(port = PORT) {
-  if (process.platform !== 'win32') return [];
-  try { return parseNetstatListeners(execFileSync('netstat', ['-ano', '-p', 'tcp'], { encoding: 'utf8' }), port); }
-  catch { return []; }
+// An explicit failure reason rather than a silent []: "the port holder list is empty" and "netstat could
+// not be run" lead to opposite next actions, and the old code made them indistinguishable.
+export function portHolderReport(port = PORT) {
+  if (process.platform !== 'win32') {
+    try { return { pids: parseLsofListeners(execFileSync('lsof', ['-nP', '-iTCP:' + port, '-sTCP:LISTEN'], { encoding: 'utf8' }), port), via: 'lsof' }; }
+    catch (e) { return { pids: [], via: 'lsof', error: String(e.message || e) }; }
+  }
+  try {
+    return { pids: parseNetstatListeners(execFileSync('netstat', ['-ano', '-p', 'tcp'], { encoding: 'utf8', windowsHide: true }), port), via: 'netstat' };
+  } catch (e) {
+    return { pids: [], via: 'netstat', error: String(e.code || e.message || e) };
+  }
 }
-const alive = (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+export const portHolderPids = (port = PORT) => portHolderReport(port).pids;
+// lsof -nP -iTCP:3080 output: "dsh  1234 me  20u  IPv4 0x…  TCP 127.0.0.1:3080 (LISTEN)"
+export function parseLsofListeners(text, port) {
+  const pids = new Set();
+  for (const line of String(text || '').split(/\r?\n/)) {
+    if (!/\(LISTEN\)/.test(line)) continue;
+    if (!new RegExp('[:.]' + port + '(?:\\s|$)').test(line)) continue;
+    const cols = line.trim().split(/\s+/);
+    const pid = Number(cols[1]);
+    if (Number.isFinite(pid) && pid > 0) pids.add(pid);
+  }
+  return [...pids];
+}
+const alive = (pid) => { try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; } };
+
+// Runs a helper to completion without capturing anything. stdio 'ignore' is deliberate: taskkill output is
+// not worth keeping, and stdout/stderr pipes are the first thing a confined host refuses to hand a child
+// (measured: execFileSync -> EPERM while spawn(…, {stdio:'ignore'}) succeeds).
+function runQuiet(file, args, timeoutMs = 10000) {
+  return new Promise((resolve) => {
+    let p;
+    try { p = spawn(file, args, { stdio: 'ignore', windowsHide: true }); }
+    catch (e) { return resolve({ code: -1, error: e.code || e.message }); }
+    const timer = setTimeout(() => { try { p.kill(); } catch {} resolve({ code: -1, error: 'timeout' }); }, timeoutMs);
+    p.on('error', (e) => { clearTimeout(timer); resolve({ code: -1, error: e.code || e.message }); });
+    p.on('exit', (c) => { clearTimeout(timer); resolve({ code: c ?? -1 }); });
+  });
+}
+
+// Stop a dsh web instance and everything it spawned. dsh web parents its own children (the PTY / pwsh /
+// run_code layer); killing only the recorded pid leaves them holding the port, which is what made "stop"
+// look broken - the bridge reported success and the next start still found 3080 taken.
+//
+// MEASURED on Windows: there is no graceful termination for these. taskkill /T answers
+// "This process can only be terminated forcefully (with /F option)" and exits 128, and a native
+// process.kill leaves the node child running. So the first attempt on Windows IS the forced tree kill;
+// pretending to ask nicely first would just add four seconds and an exit code nobody can act on.
+// On posix there is a real graceful path (SIGTERM to the group), so it keeps the grace window and only
+// escalates to SIGKILL if the process survives.
+export async function killTree(pid, { graceMs = 4000, pollMs = 250, platform = process.platform,
+  exec = runQuiet, kill = process.kill, wait = (ms) => new Promise((r) => setTimeout(r, ms)),
+  probe = alive } = {}) {
+  const steps = [];
+  if (!probe(pid)) return { pid, killed: true, alreadyGone: true, steps, hard: false, treeKill: null };
+  let treeKill = null;
+  const signal = (sig) => {
+    try { kill(pid, sig); return 'process.kill(' + sig + ')'; }
+    catch (e) { return 'process.kill(' + sig + ') failed: ' + (e.code || e.message); }
+  };
+  const waitGone = async (ms) => {
+    const deadline = Date.now() + Math.max(0, ms);
+    do {
+      await wait(pollMs);
+      if (!probe(pid)) return true;
+    } while (Date.now() < deadline);
+    return !probe(pid);
+  };
+
+  if (platform === 'win32') {
+    const r = await exec('taskkill', ['/pid', String(pid), '/T', '/F']);
+    steps.push(r.code === 0 ? 'taskkill /T /F' : 'taskkill /T /F failed: ' + (r.error || 'exit ' + r.code));
+    if (r.code !== 0) treeKill = r.error || 'exit ' + r.code;
+    if (await waitGone(graceMs)) return { pid, killed: true, steps, hard: true, treeKill };
+    // taskkill was unavailable or refused. The parent can still be signalled; its children may not be.
+    steps.push(signal('SIGKILL'));
+    treeKill = treeKill || 'taskkill did not take the tree down';
+    if (await waitGone(3000)) return { pid, killed: true, steps, hard: true, treeKill };
+    return { pid, killed: false, steps, hard: true, treeKill };
+  }
+
+  // posix: a real SIGTERM first, so dsh can flush its session log.
+  try { kill(-pid, 'SIGTERM'); steps.push('SIGTERM (group)'); }
+  catch { steps.push(signal('SIGTERM')); }
+  if (await waitGone(graceMs)) return { pid, killed: true, steps, hard: false, treeKill };
+  try { kill(-pid, 'SIGKILL'); steps.push('SIGKILL (group)'); }
+  catch { steps.push(signal('SIGKILL')); }
+  if (await waitGone(3000)) return { pid, killed: true, steps, hard: true, treeKill };
+  return { pid, killed: false, steps, hard: true, treeKill };
+}
 
 // Captured stdout may be UTF-8 or UTF-16 depending on how the redirect was done.
 export function readTextSmart(file) {
@@ -240,9 +326,11 @@ export async function status() {
   const open = await portOpen();
   let mine = null;
   try { mine = JSON.parse(fs.readFileSync(INSTANCE, 'utf8')); } catch {}
-  const holders = portHolderPids();
+  const hold = portHolderReport();
+  const holders = hold.pids;
   const out = { stateDir: STATE_DIR, host: HOST, port: PORT, listening: open, tokenCaptured: !!currentToken(),
-    captureFile: OUT_FILE, ownedByUs: mine, portHolderPids: holders };
+    captureFile: OUT_FILE, ownedByUs: mine, portHolderPids: holders, portHolderVia: hold.via,
+    ...(hold.error ? { portHolderError: hold.error } : {}) };
   if (open && mine?.pid) {
     out.recordedPidAlive = alive(mine.pid);
     out.holderIsOurs = holders.includes(mine.pid);
@@ -250,9 +338,17 @@ export async function status() {
     // install a plugin, run git, or spawn anything at all.
     out.toolchain = mine.toolchain ?? null;
     out.problems = toolchainProblems(mine.toolchain);
+    if (!out.recordedPidAlive) {
+      out.problems.push('instance.json records pid ' + mine.pid + ', which is no longer running: the listener on ' + PORT
+        + ' is a different process. `node launch.mjs stop` would refuse it; pass --pid after confirming the owner.');
+    }
+    if (!out.holderIsOurs) {
+      out.problems.push('the listener on ' + PORT + ' is not the pid this state directory recorded ('
+        + (holders.length ? holders.join('/') : hold.error ? 'unknown: ' + hold.error : 'unknown') + ').');
+    }
   } else if (open && !mine?.pid) {
     out.problems = ['something listens on ' + HOST + ':' + PORT + ' but this state directory did not record starting it'
-      + (holders.length ? ' (listener pid ' + holders.join('/') + ')' : '')
+      + (holders.length ? ' (listener pid ' + holders.join('/') + ')' : hold.error ? ' (the listener could not be identified: ' + hold.error + ')' : '')
       + '. Stop it from the tree that owns it, or confirm the pid and use `node launch.mjs stop --pid <pid>`.'];
   }
   return out;
@@ -322,33 +418,65 @@ export async function start({ quiet = false } = {}) {
   return { ok: false, error: 'timed out waiting for the other process to bring dsh web up (lock held by pid ' + (lock.holder || '?') + ')' };
 }
 
+// Stopping the instance. Three situations, and the old code only handled the first:
+//   ours      - instance.json records a pid this call is allowed to kill (the process we spawned);
+//   confirmed - a human passed --pid for an instance some other tree started (the only defensible way
+//               to kill a process we did not spawn);
+//   foreign   - something holds the port and we have no pid for it. That is still a question the caller
+//               deserves an answer to, so we report what we can see and what it would take.
+// The kill itself is a tree kill: dsh web parents its own children, and killing only the parent leaves
+// them holding the port, which used to read as "the stop failed".
 export async function stop({ pid: confirmed = 0 } = {}) {
-  const looked = { stateDir: STATE_DIR, instanceFile: INSTANCE };
+  const looked = { stateDir: STATE_DIR, instanceFile: INSTANCE, host: HOST, port: PORT };
   let mine = null;
   try { mine = JSON.parse(fs.readFileSync(INSTANCE, 'utf8')); } catch {}
-  const holders = portHolderPids();
+  const hold = portHolderReport();
+  const listening = await portOpen();
   const target = mine?.pid || confirmed;
-  // Two trees, two state directories: run this from the one that did not boot the instance and the old
-  // message read like "there is no way to stop it". It is not the bridge's process to kill on a guess,
-  // so say who holds the port and take the pid from a human who confirmed it.
   if (!target) {
-    return { ok: false, ...looked, portHolderPids: holders,
+    return { ok: false, stopped: false, ...looked, listening, portHolderPids: hold.pids, portHolderVia: hold.via,
+      ...(hold.error ? { portHolderError: hold.error } : {}),
       error: 'no instance.json here, so this tree did not start whatever holds ' + HOST + ':' + PORT
         + ' - killing a process the bridge does not own is a guess, not a stop',
-      hint: holders.length ? 'confirm it is yours, then: node launch.mjs stop --pid ' + holders[0] : 'nothing is listening on the port' };
+      hint: hold.pids.length ? 'confirm it is yours, then: node launch.mjs stop --pid ' + hold.pids[0]
+        : hold.error ? 'the listener could not be identified (' + hold.error + '); find it with another tool and pass --pid'
+        : 'nothing is listening on the port' };
   }
   if (mine?.pid && confirmed && confirmed !== mine.pid) {
-    return { ok: false, ...looked, error: 'this tree recorded pid ' + mine.pid + ' but you asked to stop ' + confirmed + ' - check `node launch.mjs status` first' };
+    return { ok: false, stopped: false, ...looked, error: 'this tree recorded pid ' + mine.pid + ' but you asked to stop ' + confirmed + ' - check `node launch.mjs status` first' };
   }
-  try { process.kill(target); }
-  catch (e) { return { ok: false, ...looked, stoppedPid: null, error: 'kill failed: ' + e.message, portHolderPids: portHolderPids() }; }
-  await new Promise((r) => setTimeout(r, 1500));
+  const wasAlive = alive(target);
+  if (!wasAlive && !confirmed) {
+    // A record from a crashed boot: forget it, but do not report a stop that did not happen.
+    try { fs.rmSync(INSTANCE, { force: true }); } catch {}
+    return { ok: false, stopped: false, ...looked, listening, recordedPid: target, portHolderPids: hold.pids,
+      error: 'this tree recorded pid ' + target + ' but that process is gone; nothing was stopped',
+      hint: hold.pids.length ? 'something else holds ' + PORT + ': node launch.mjs stop --pid ' + hold.pids[0] : 'port ' + PORT + ' is free' };
+  }
+  const killed = await killTree(target);
   try { fs.rmSync(SPAWN_LOCK, { force: true }); } catch {}
-  try { fs.rmSync(INSTANCE, { force: true }); } catch {}   // the process is gone; a stale record would make the next start refuse
+  // A record from a crash is worthless, but a record whose process refused to die must stay: deleting it
+  // would make the next `stop` claim this tree never started the instance while it is still listening.
+  const stillListening = await portOpen();
+  if (!stillListening) { try { fs.rmSync(INSTANCE, { force: true }); } catch {} }
   const still = portHolderPids();
-  return { ok: still.length === 0 && !(await portOpen()), stoppedPid: target, stillListeningOnPort: still,
-    note: still.length ? 'pid ' + still.join('/') + ' still holds ' + PORT + ': it is not the process we stopped, or a child of it survived'
-      : 'port ' + PORT + ' is free' };
+  const ok = !stillListening;
+  const notes = [];
+  if (ok) notes.push('port ' + PORT + ' is free');
+  else if (still.length) notes.push('pid ' + still.join('/') + ' still holds ' + PORT + ': it is not the process we stopped, or a child of it was reparented and survived');
+  else notes.push('the port still answers but no listener could be attributed to it');
+  // Windows without taskkill can only signal the parent. Say so: a surviving child is a real thing the
+  // operator has to know about, and the port probe above is what proves it.
+  if (killed.treeKill && !ok) {
+    notes.push('the process tree could not be taken down as a tree (taskkill: ' + killed.treeKill
+      + '); only the recorded pid was signalled, so a child may still hold the port');
+  }
+  if (!killed.killed && ok) notes.push('the process exited while it was being signalled');
+  return { ok, stopped: killed.killed, ...looked, stoppedPid: target, signalSteps: killed.steps,
+    ...(killed.treeKill ? { treeKillUnavailable: killed.treeKill } : {}),
+    ...(killed.hard ? { hard: true } : {}), ...(killed.alreadyGone ? { alreadyGone: true } : {}),
+    wasListening: listening, stillListening, stillListeningOnPort: still,
+    note: notes.join('; ') };
 }
 
 // Windows: fs.chmodSync(0o600) does nothing - POSIX mode bits are not enforced there (measured: the
@@ -465,6 +593,8 @@ if (process.argv[1] && process.argv[1].endsWith('launch.mjs')) {
     : cmd === 'doctor' ? await doctor()
     : cmd === 'start' ? await start()
     : cmd === 'stop' ? await stop({ pid: Number(flag('--pid')) || 0 })
+    : cmd === 'restart' ? { stop: await stop({ pid: Number(flag('--pid')) || 0 }),
+        start: await start({ quiet: false }) }
     : cmd === 'lock-acl' ? lockTokenAcl(process.argv[3] || OUT_FILE)
     : resolveDsh();
   console.log(JSON.stringify(out, null, 1));

@@ -3,7 +3,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'node:path';
-import { childPath, resolveToolchain, toolchainProblems, parseNetstatListeners, npmGlobalBinDir } from '../launch.mjs';
+import { childPath, resolveToolchain, toolchainProblems, parseNetstatListeners, parseLsofListeners,
+  npmGlobalBinDir, killTree } from '../launch.mjs';
 
 const D = path.delimiter;
 
@@ -68,3 +69,85 @@ test('the port holder is read from netstat without guessing', () => {
 test('npmGlobalBinDir stays empty when the platform has no APPDATA', () => {
   assert.equal(npmGlobalBinDir({}), '');
 });
+
+test('the port holder is read from lsof on posix, without matching a longer port', () => {
+  const text = [
+    'dsh     1234 me   20u  IPv4 0x1  0t0  TCP 127.0.0.1:3080 (LISTEN)',
+    'dsh     5678 me   21u  IPv6 0x2  0t0  TCP *:3080 (LISTEN)',
+    'node    9999 me   22u  IPv4 0x3  0t0  TCP 127.0.0.1:13080 (LISTEN)',
+    'node    4321 me   23u  IPv4 0x4  0t0  TCP 127.0.0.1:3080->127.0.0.1:5555 (ESTABLISHED)',
+  ].join('\n');
+  assert.deepEqual(parseLsofListeners(text, 3080), [1234, 5678], 'only LISTEN rows, and 13080 is a different port');
+  assert.deepEqual(parseLsofListeners('', 3080), []);
+});
+
+// The stop path had no tests at all, which is how it shipped a kill that never killed anything. These
+// pin the behaviour that was measured on this platform, not the behaviour one would like to have.
+//
+// MEASURED on Windows: taskkill /T without /F answers "This process can only be terminated forcefully
+// (with /F option)" and exits 128; a native process.kill leaves the node child running. There is no
+// graceful path to preserve, so the first attempt IS the forced tree kill. On posix there is one, and
+// it keeps its grace window.
+test('killTree forces the tree on Windows, because nothing gentler works there', async () => {
+  const steps = [];
+  let alive = true;
+  const res = await killTree(42, {
+    graceMs: 1000, pollMs: 10, platform: 'win32',
+    exec: async (file, args) => { steps.push(file + ' ' + args.join(' ')); alive = false; return { code: 0 }; },
+    kill: () => { throw new Error('native kill must not be used while taskkill works'); },
+    wait: async () => {}, probe: () => alive,
+  });
+  assert.deepEqual(steps, ['taskkill /pid 42 /T /F'], 'one forced tree kill, not a hopeful SIGTERM first');
+  assert.equal(res.killed, true);
+  assert.equal(res.hard, true);
+  assert.equal(res.treeKill, null, 'taskkill worked, so nothing is reported as unavailable');
+});
+
+test('killTree gives posix a real SIGTERM first and only then SIGKILL', async () => {
+  const seen = [];
+  let alive = true;
+  const res = await killTree(43, {
+    graceMs: 30, pollMs: 5, platform: 'linux',
+    kill: (pid, sig) => { seen.push(sig); if (sig === 'SIGKILL') alive = false; },
+    wait: async () => {}, probe: () => alive,
+  });
+  assert.deepEqual(seen, ['SIGTERM', 'SIGKILL'], 'graceful first, then forced - the posix contract');
+  assert.equal(res.killed, true);
+  assert.equal(res.hard, true);
+});
+
+test('killTree falls back to a native signal when taskkill is unavailable, and says so', async () => {
+  // A confined host refuses to start taskkill (measured: EPERM). The parent can still be signalled;
+  // the children may not be, and that has to reach the caller rather than look like a clean stop.
+  const seen = [];
+  let alive = true;
+  const res = await killTree(44, {
+    graceMs: 20, pollMs: 5, platform: 'win32',
+    exec: async () => ({ code: -1, error: 'EPERM' }),
+    kill: (pid, sig) => { seen.push(sig); alive = false; },
+    wait: async () => {}, probe: () => alive,
+  });
+  assert.equal(res.treeKill, 'EPERM', 'the tree kill failure is carried out, not swallowed');
+  assert.deepEqual(seen, ['SIGKILL'], 'the parent is still signalled natively');
+  assert.equal(res.killed, true);
+});
+
+test('killTree reports a process it could not kill instead of claiming success', async () => {
+  const res = await killTree(46, {
+    graceMs: 10, pollMs: 5, platform: 'win32',
+    exec: async () => ({ code: -1, error: 'EPERM' }),
+    kill: () => {}, wait: async () => {}, probe: () => true,
+  });
+  assert.equal(res.killed, false, 'a survivor is a failure, not a stop');
+  assert.equal(res.treeKill, 'EPERM');
+});
+
+test('killTree on an already-dead pid touches nothing', async () => {
+  let called = false;
+  const res = await killTree(45, { platform: 'win32', exec: async () => { called = true; return { code: 0 }; },
+    kill: () => { called = true; }, probe: () => false, wait: async () => {} });
+  assert.equal(res.alreadyGone, true);
+  assert.equal(res.killed, true);
+  assert.equal(called, false, 'no signal is sent to a pid that is gone');
+});
+
