@@ -12,7 +12,7 @@ import { fileURLToPath } from 'node:url';
 import { ARGS, envelope, authCookie, pastCursor, parseAllowlist, allowedText, checkPolicy, splitModel,
   modelLabel, ALIAS_RE, checkAlias, checkCwd, normCwd, roundRecord, baselineFrom, interpret, argText,
   unwrapProjections, pathsOutsideCwd, pageWindow, sliceRound, permissionHistory, approvalState,
-  walkRound } from '../lib/api-contract.mjs';
+  walkRound, verdictFields } from '../lib/api-contract.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const PKG = path.resolve(HERE, '..');
@@ -201,25 +201,62 @@ test('interpret hands back the failing tool bodies, not just a count', () => {
   assert.equal(clean.sandboxDenials, 0);
 });
 
-test('pathsOutsideCwd flags the dispatch that the sandbox will deny', () => {
+test('pathsOutsideCwd blocks writes outside the workspace and only those', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-cwd-test-'));
   const WS = path.join(root, 'research');
   const TARGET = path.join(root, 'checkout-x');
   fs.mkdirSync(WS); fs.mkdirSync(TARGET);
+  const tiers = (task, cwd) => pathsOutsideCwd(task, cwd);
   try {
-    assert.deepEqual(pathsOutsideCwd(`在 ${TARGET} 里实现并跑测试`, WS), [TARGET]);
-    assert.deepEqual(pathsOutsideCwd(`把 "${TARGET}" 里的 docs/a.md 补测试`, WS), [TARGET], 'a quoted path keeps its spaces');
-    assert.deepEqual(pathsOutsideCwd(`读取 ${path.join(WS, 'notes.md')} 后总结`, WS), [], 'inside the workspace is not a warning');
-    assert.deepEqual(pathsOutsideCwd('普通中文任务，没有路径', WS), [], 'prose must not warn');
-    assert.deepEqual(pathsOutsideCwd('see https://www.unicode.org/reports/tr15/ for details', WS), [], 'a URL is not a path');
+    assert.deepEqual(tiers(`在 ${TARGET} 里实现并跑测试`, WS), { all: [TARGET], write: [TARGET], read: [] });
+    assert.deepEqual(tiers(`把 "${TARGET}" 里的 docs/a.md 补测试`, WS), { all: [TARGET], write: [TARGET], read: [] }, 'a quoted path keeps its spaces');
+    assert.deepEqual(tiers(`读取 ${path.join(WS, 'notes.md')} 后总结`, WS), { all: [], write: [], read: [] }, 'inside the workspace is never listed');
+    assert.deepEqual(tiers('普通中文任务，没有路径', WS), { all: [], write: [], read: [] }, 'prose must not warn');
+    assert.deepEqual(tiers('see https://www.unicode.org/reports/tr15/ for details', WS), { all: [], write: [], read: [] }, 'a URL is not a path');
     // The false positive that made the advisory ignorable: an unquoted Windows path containing a space
     // matches only its first token. "…\Program Files" is not a real directory, so it must be dropped.
     const withSpace = path.join(root, 'Program Files', 'nodejs');
-    assert.deepEqual(pathsOutsideCwd(`run ${withSpace}\\node.exe --version`, WS), [], 'a fragment cut at a space is not reported');
+    assert.deepEqual(tiers(`run ${withSpace}\\node.exe --version`, WS).all, [], 'a fragment cut at a space is not reported');
     fs.mkdirSync(withSpace, { recursive: true });
-    assert.deepEqual(pathsOutsideCwd(`run "${withSpace}\\node.exe" --version`, WS), [`${withSpace}\\node.exe`], 'the same path quoted is reported in full, as written');
-    assert.deepEqual(pathsOutsideCwd(`work in ${root}`, WS), [], 'an ancestor of the workspace is not outside it');
+    assert.deepEqual(tiers(`run "${withSpace}\\node.exe" --version`, WS).all, [`${withSpace}\\node.exe`], 'the same path quoted is reported in full, as written');
+    assert.deepEqual(tiers(`work in ${root}`, WS), { all: [], write: [], read: [] }, 'an ancestor of the workspace is not outside it');
+
+    // The tiering is what makes the recommended shape usable: the ticket lives in the parent repo and
+    // is read-only; the deliverable is written into the worktree. Refusing that was the reported defect.
+    const TICKET = path.join(root, 'dispatch', '02f.md');
+    const SKILL = path.join(root, 'skills', 'tdd', 'SKILL.md');
+    fs.mkdirSync(path.dirname(TICKET), { recursive: true }); fs.writeFileSync(TICKET, 'x');
+    fs.mkdirSync(path.dirname(SKILL), { recursive: true }); fs.writeFileSync(SKILL, 'x');
+    const brief = `目标：修复 NFC。\n任务正文：${TICKET}（只读引用）\n技能约定 ${SKILL}\n边界：只允许改动 ${TARGET}\n验收：把结论写入 ${TARGET}\\report.md`;
+    const t = tiers(brief, WS);
+    assert.deepEqual(t.write, [TARGET], 'the write target alone is what the sandbox will deny');
+    assert.deepEqual(t.read, [TICKET, SKILL], 'read-only references are advisory, not a refusal');
+    // A read-only annotation *after* the path wins over an earlier verb, and a later verb must not
+    // condemn an earlier path: this asymmetry is the whole classification.
+    assert.deepEqual(tiers(`把 ${TARGET}\\a.md 的结论抄到 ${path.join(root, 'other', 'b.md')}，${TARGET} 只读`, WS).read,
+      [TARGET], 'the annotation demotes the path it follows');
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('verdictFields never claims a verdict the round has not produced', () => {
+  const running = { settled: false, state: 'running' };
+  const window = { sinceSeq: 4, newestSeq: 28, asOfSeq: 1084, truncated: true, reachedLogEnd: false };
+  // The reported defect: a still-running round whose log happened to be fully read must not report
+  // verdictComplete:true just because nothing was truncated.
+  const fully = { sinceSeq: 4, newestSeq: 28, asOfSeq: 28, truncated: false, reachedLogEnd: true };
+  assert.deepEqual(verdictFields(running, window), { windowTruncated: true, verdictComplete: false, logExhausted: false,
+    note: 'no turn/end within seq 4..28 of 1084; state is not a verdict - re-read with dsh_result' });
+  const still = verdictFields(running, fully);
+  assert.equal(still.verdictComplete, false, 'running is running, whatever the window says');
+  assert.equal(still.logExhausted, true, 'but the read did reach the end, and that is worth saying');
+  // "Read to the end and this round recorded nothing" is the unverified-dispatch case, not a timeout.
+  const idle = verdictFields({ settled: false, state: 'idle' }, fully);
+  assert.equal(idle.verdictComplete, false);
+  assert.match(idle.note, /dispatch was not picked up/);
+  const done = verdictFields({ settled: true, state: 'completed' }, fully);
+  assert.deepEqual(done, { windowTruncated: false, verdictComplete: true, logExhausted: true }, 'a settled round gets no note');
+  assert.deepEqual(verdictFields({ settled: false, state: 'running' }, null),
+    { windowTruncated: false, verdictComplete: false, logExhausted: false }, 'no window is never a verdict');
 });
 
 test('sliceRound keeps a verdict inside its own round', () => {
@@ -337,6 +374,7 @@ test('walkRound pages to a verdict that one window cannot reach', () => {
     assert.equal(r.events[r.events.length - 1].seq, 1084, 'and stops there - seq 1444 belongs to the next round');
     assert.equal(r.window.pages, 3);
     assert.equal(r.window.truncated, false);
+    assert.equal(r.window.reachedLogEnd, false, 'the round was cut at 1084 while the log runs to 1445');
     assert.equal(r.window.newestSeq, 1084);
     assert.deepEqual(calls.slice(1).map((c) => c.n), [24, 1000, 1000], 'polling stays cheap until a verdict is wanted');
   });

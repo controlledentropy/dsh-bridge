@@ -192,9 +192,11 @@ dsh_status {alias}                 查看模型、token 用量和上下文压力
 
 沙箱拒绝**不会**在服务端排队等待审批：它以 `isError` 的工具结果返回，dsh 把"可以提权重试"的提示写在正文里——但在无人值守的派单场景里没有人能点这个确认，那句提示等于不会兑现。因此 `sandboxDenials > 0` 的含义是"任务的写入范围超出了会话工作区"，正确处置是换 `cwd` 重开会话，而不是等待或重试。判定只认 `file access denied` / `escalation available` / `EPERM`：dsh 会给各种失败结果都追加 `File sandbox: <mode>.` 脚注，拿它当判据会把普通报错也算成拒绝（实测 8 条错误里只有 1 条是真拒绝）。
 
-会话的写入边界就是它的 `cwd`。**任务文本里出现工作区之外的绝对路径时，`dsh_launch` / `dsh_send` 直接拒绝下发**（错误里列出这些路径），因为那一轮注定被沙箱拒绝、只会白烧额度；确属只读引用时传 `allowOutsideCwd: true` 放行，返回里会带 `warnings` 与 `outsideCwd`。任务要改动别的仓库时，以那个仓库作为 `cwd` 建会话（侧边栏分栏跟随 `cwd`），不要在 A 工作区的会话里写 B 目录。
+会话的写入边界就是它的 `cwd`。**"提到一个路径"和"要往那个路径写"是两件事**，桥接按路径附近的意图词分级（中文动词后置的写法也算，例如"在 X 里实现"）：只有判定为**写入**工作区外路径的派单会被拒绝下发（错误里列出这些路径），因为那一轮注定被沙箱拒绝、只会白烧额度；只读提及（工单正文在父仓、技能定义在 `~/.agents/skills`、工具在 `Program Files`）只在返回里告警。返回的 `outsideCwd` 是 `{ all, write, read }` 三档，`allowOutsideCwd: true` 越过 write 档。分级是启发式，判错时用这个参数显式放行即可。任务要改动别的仓库时，以那个仓库作为 `cwd` 建会话（侧边栏分栏跟随 `cwd`），不要在 A 工作区的会话里写 B 目录。
 
-一轮可以横跨上千条事件，任何固定大小的窗口都是在猜本轮有多长，所以判决读取是**从本轮 baseline 起沿游标向前走（首页 24 条、之后每页 1000 条、上限 12 页）直到本轮自己的 `turn/end` 落进已读事件，再截断到该事件**：既不会把下一轮的 `completed` 当成本轮结论，也不会因为窗口够不到而把一个已完成的轮次读成 `idle`（即"什么都没发生"）。这两种翻车都实测过。返回里的 `windowTruncated` 表示窗口没覆盖到日志末尾，`verdictComplete` 表示本轮判决确实在窗口内——两者要一起看；`window.newestSeq` 只报截断后真正读到的位置。中止还会带 `abortReason`（实测 `user` 表示是人中止的，不是 dsh 自己放弃）。
+一轮可以横跨上千条事件，任何固定大小的窗口都是在猜本轮有多长，所以判决读取是**从本轮 baseline 起沿游标向前走（首页 24 条、之后每页 1000 条、上限 12 页）直到本轮自己的 `turn/end` 落进已读事件，再截断到该事件**：既不会把下一轮的 `completed` 当成本轮结论，也不会因为窗口够不到而把一个已完成的轮次读成 `idle`（即"什么都没发生"）。这两种翻车都实测过。三个字段各司其职，不要合并理解：`verdictComplete` **只表示本轮自己的 `turn/end` 已读到**（等于 `settled`，正常运行中一定是 `false`）；`windowTruncated:true` 表示还没读到日志末尾，此时 `state` 不是判决，要用 `dsh_result` 重读；`logExhausted:true` 且 `state:"idle"` 表示日志已到末尾而这轮压根没记录 `turn/start`/`turn/end`，即派单没被接手。`window.newestSeq` 只报截断后真正读到的位置。中止还会带 `abortReason`（实测 `user` 表示是人中止的，不是 dsh 自己放弃）。
+
+**要求 `git commit` 的任务在 `workspace-write` 下结构性不可行**：git worktree 的索引与对象元数据位于主仓的 `.git/worktrees/<name>/`，在会话工作区之外，因此每次提交都会触发审批。派单里要提交，就必须要么下发前由人把会话提到 `danger-full-access`，要么让执行者只产出改动、提交由会话外的人做。
 
 **`workspace-write` 不等于无人值守可用。** 实测：即便工作目录已授权，`pwsh` / git 这类操作仍会触发 dsh 的审批（`approval/asked`）并**停在人身上**，而 `session/list.running` 依然是 `true`，从外面看只是"跑得慢"。桥接因此把 `approvalPolicy` / `approvalAsked` / `approvals[]` / `pending[]`（尚无 `approval/decided` 的那些）一并返回，`dsh_wait` 一旦发现 `pending` 非空就立即返回而不是耗完窗口——继续等不会有人来点。要真正无人值守，会话需处于 `danger-full-access`（审批策略随之变 `never`）；派单前用 `dsh_status {alias}` 看 `approvalPolicy` 与 `unattended` 两个字段确认。
 
@@ -206,12 +208,12 @@ dsh_status {alias}                 查看模型、token 用量和上下文压力
 | --- | --- | --- |
 | `dsh_models` | 无 | 返回实时模型目录与允许清单的交集，包含默认模型、可路由 provider 和加载失败信息 |
 | `dsh_permissions` | 可选 `alias` | **只读**查看沙箱面：dsh 提供的档位（`read-only` / `workspace-write` / `danger-full-access`）、实例默认档位；给了 `alias` 还会返回该会话的生效档位与变更史（`escalated`、`escalatedBy`、`approvals`）。**改档位不在这里**：`/api` 上没有 per-session 写入口，只能在 dsh UI 里由人操作 |
-| `dsh_launch` | `alias`, `cwd`, `task`; 可选 `phase`, `group`, `dryRun`, `allowOutsideCwd`, `model`, `reasoningEffort` | 新建命名会话、设置模型并提交第一轮；`dryRun` 只创建会话，不执行任务 |
-| `dsh_send` | `alias`, `task`; 可选 `allowOutsideCwd`, `model`, `reasoningEffort` | 向同一会话提交下一轮 |
+| `dsh_launch` | `alias`, `cwd`, `task`; 可选 `phase`, `group`, `dryRun`, `allowOutsideCwd`, `model`, `reasoningEffort` | 新建命名会话、设置模型并提交第一轮；`dryRun` 只创建会话，不执行任务。任务被判定为**向工作区外写入**时在下发前拒绝，只读提及外部路径不拦 |
+| `dsh_send` | `alias`, `task`; 可选 `allowOutsideCwd`, `model`, `reasoningEffort` | 向同一会话提交下一轮（同一阶段返工用它，新阶段用新 `alias`） |
 | `dsh_adopt` | `alias`, `sessionId`, `cwd`; 可选 `phase` 等 | 接管已存在的 `dsh web` 会话，不改变其分栏 |
 | `dsh_wait` | `alias`; 可选 `maxSeconds`（≤ 45） | 在限定时间内等待本轮完成；返回本轮自己的判决（`state` / `verdictComplete`），若本轮停在人工审批上则立即返回 `pending[]` 而不空等 |
 | `dsh_status` | `alias` | 返回本轮状态、模型、token 用量、上下文压力、待答问题，以及会话边界信息：`workingDirectory`、`sandbox`（如 `workspace-write`）、`agentPreset`、`approvalPolicy` / `unattended`（能否无人值守）、`sessionStats` |
-| `dsh_result` | `alias`; 可选 `messages`（≤ 40）、`round` | 获取某一轮（默认最新一轮）的验收载荷：助手文本、工具调用、落盘文件、`toolErrors[]`（含失败正文与错误码）、`sandboxDenials`、`window` / `windowTruncated` / `verdictComplete` |
+| `dsh_result` | `alias`; 可选 `messages`（首页事件数，≤ 1000）、`round` | 获取某一轮（默认最新一轮）的验收载荷：**该轮全部**助手文本、工具调用、落盘文件、`toolErrors[]`（含失败正文与错误码）、`sandboxDenials`、`window` / `windowTruncated` / `verdictComplete` / `logExhausted`。`messages` 只影响首页大小，不影响完整性 |
 | `dsh_sessions` | 可选 `cwd` | 查看桥接持有的别名；传入 `cwd` 时额外查询该工作区的活会话 |
 | `dsh_cancel` | `alias` | 请求取消当前轮；需再次检查最终状态 |
 
@@ -311,7 +313,7 @@ node launch.mjs stop        # 仅停止桥接记录为自己管理的实例
 ### 契约测试与诊断工具
 
 ```bash
-npm test                                  # 30 个离线契约 / MCP 子进程测试
+npm test                                  # 31 个离线契约 / MCP 子进程测试
 node tests/live-check.mjs                 # 已运行实例的只读复验（需能读取当前实例的启动 token）
 node tools/probe-api.mjs                  # 探查 /api 端点参数形状
 node tools/probe-acp.mjs                  # 检查 ACP 接口
@@ -371,12 +373,15 @@ GitHub Actions 工作流配置在 Linux / Windows、Node.js 20 / 22 上运行离
 | `run_code` 报 `ENOENT …\undefined\temp\…` 或写 `%TEMP%` 报 `EPERM` | dsh 的 `run_code` 会清空进程环境，`os.tmpdir()` 因此拼出相对路径；写真实 TEMP 又被沙箱拒绝 | 任务包里显式规定临时文件写在会话工作区内的绝对路径 |
 | 子进程"没有输出也没有退出码"（例如 git 明明装了） | 宿主环境 `PATHEXT` 不含 `.EXE`（打包应用的子进程环境可能不是注册表那份），PowerShell 会静默不启动 | `node launch.mjs doctor` 的 `env.problems` 会直接报出来；对比注册表 `Session Manager\Environment` 的值 |
 | dsh 设置里 Agent presets 只剩两个 | `ptc` / `minimal` 需要 Developer tools 偏好开启，而该偏好被 profile 补丁写成了 `enabled: false` | 与桥接无关：`agentPresets/list` 仍返回全部档位；在 dsh 设置里打开 Developer tools，或删掉 `profiles/<p>/cordis.patch.yml` 里的 `ui-settings` 覆盖 |
+| 任务里的 `git commit` 反复弹审批（工作目录已授权也一样） | git worktree 的索引与对象元数据在主仓 `.git/worktrees/<name>/`，位于会话工作区之外 | 派单前由人把会话提到 `danger-full-access`，或让执行者只产出改动、提交在会话外做；这不是桥能绕开的 |
+| 派单被 `outside the session workspace` 拒绝，但你确定那些路径只是读 | 意图分级是启发式，中文写法多样，可能把只读引用判成写入 | 看返回里的 `outsideCwd.write` / `.read` 两档；确属误判就传 `allowOutsideCwd: true` 放行，不要改桥的规则 |
 | 源码目录里出现 `.dsh-*-cache/logs/*.log` | 由桥接冷启动的 `dsh web` 会把插件缓存写进自己的启动目录，也就是桥接源码目录 | 与桥接逻辑无关，已在 `.gitignore` 中忽略、不要提交；介意就按"长期本地部署"一节让 `dsh web` 在别处启动，桥接只负责连接 |
 
 ## 安全与使用边界
 
 - **token 等同于高权限凭据**：`dsh web` 的 owner cookie 不对每个方法再做独立授权。能读取 stdout 捕获文件的用户，可能取得对本机 `dsh` 实例的 owner 访问能力。不要提交、转发或共享这些文件。
-- **保护状态目录及任务原文**：`.state/` 已在 `.gitignore` 中；`sessions.json` 会逐字保存每轮下发的完整任务文本，可能包含路径、需求细节或敏感信息。stdout 捕获文件按 `600` 权限处理，但在 Windows 上还应检查实际 ACL。不要把整个 `.state/` 放在多人共享目录或同步盘中。
+- **保护状态目录及任务原文**：`.state/` 已在 `.gitignore` 中；`sessions.json` 会逐字保存每轮下发的完整任务文本，可能包含路径、需求细节或敏感信息。不要把整个 `.state/` 放在多人共享目录或同步盘中。
+- **Windows 上 `chmod` 拦不住 token**：桥接会尝试 `chmod(0o600)`，但实测在 NTFS 上这是空操作（mode 仍是 `666`，文件的 ACE 直接继承所在目录），而捕获文件里那 43 字符的启动 token 就是整个实例的 bearer 凭据。真正的边界是 ACL：`node launch.mjs doctor` 会跑 `icacls` 并把"除当前用户/SYSTEM/Administrators 之外还能读它的主体"列进 `problems`；要收紧就显式执行 `node launch.mjs lock-acl`（它 `/inheritance:r` 后只授当前用户完全控制——会移除继承授权，所以不自动做）。POSIX 平台按 mode 位检查即可。
 - **保持本机边界**：桥接默认连接 `127.0.0.1`，不需要对外提供 HTTP MCP 服务。不要将 `dsh web` 的 API、启动 token 或带凭据的连接代理暴露到不可信网络。
 - **工作区操作是真实的**：被委派的 agent 会在 `dsh` 自己的工作区中修改文件。为不可信任务准备独立沙箱、限制可写范围，并检查 diff、测试输出与交付文件。
 - **会话账本不是结果缓存**：`sessions.json` 保存会话句柄、请求 ID、每轮基线及任务原文，**不缓存助手输出和执行结果**。写入采用排他锁与临时文件 rename；持久化失败会报错，但不表示对同一别名并发下发是安全的。

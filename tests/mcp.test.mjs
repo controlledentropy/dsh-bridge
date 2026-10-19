@@ -105,6 +105,13 @@ test('every pre-flight refusal happens before dsh is touched', async () => {
         assert.ok(!('raw' in body), `${name} error payload must be JSON, got ${JSON.stringify(body).slice(0, 200)}`);
         assert.match(String(body.error), re, `${name} should explain itself, got ${JSON.stringify(body)}`);
       }
+      // ...and the tiering must not swallow the recommended shape: naming an outside path that the task
+      // only reads is not a write, so it has to get past this check and fail further down instead.
+      const readOnly = await client.callTool({ name: 'dsh_launch', arguments: { alias: 'ok', cwd: ws.cwd,
+        task: `任务正文：${path.join(ws.sibling, 'ticket.md')}（只读引用）。把结论写入 ${path.join(ws.cwd, 'report.md')}` } });
+      const body = parsed(readOnly);
+      assert.ok(!/outside the session workspace/.test(String(body.error || '')),
+        `a read-only reference must not be refused by the path check, got ${JSON.stringify(body).slice(0, 240)}`);
     });
     assertNoSideEffects(ws.state);
   } finally { ws.cleanup(); }

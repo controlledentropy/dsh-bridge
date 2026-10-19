@@ -27,7 +27,7 @@ import { HOST as LAUNCH_HOST, PORT as LAUNCH_PORT, STATE_DIR as LAUNCH_STATE, OU
 import { ARGS, envelope, authCookie, pastCursor, parseAllowlist, allowedText, checkPolicy, splitModel,
   checkAlias, checkCwd, normCwd, roundRecord, baselineFrom, interpret, modelLabel,
   unwrapProjections, pathsOutsideCwd, pageWindow as calcWindow, permissionHistory, walkRound,
-  approvalState, PAGE_SIZE, MAX_PAGES } from './lib/api-contract.mjs';
+  approvalState, verdictFields, PAGE_SIZE, MAX_PAGES } from './lib/api-contract.mjs';
 
 const num = (name, value, fallback) => {
   const n = Number(value);
@@ -327,24 +327,29 @@ async function readRound(s, opts = {}) {
   const p = await projections(s.sessionId).catch(() => null);
   const r = interpret(events, row?.running ?? null);
   const ap = approvalState(events);
-  const unseen = !r.settled && window?.truncated;
-  const blocked = !r.settled && ap.pending.length > 0;
-  return { ...r, ...ap, window, windowTruncated: !!window?.truncated, verdictComplete: r.settled || !unseen,
-    ...(blocked ? { note: `waiting on ${ap.pending.length} unanswered approval(s) - ${ap.pending.map((x) => x.toolName).join(', ')}; an unattended dispatch cannot proceed until a human answers in the dsh UI` }
-      : unseen ? { note: `no turn/end within seq ${window.sinceSeq}..${window.newestSeq} of ${window.asOfSeq}; state is not a verdict - re-read with dsh_result` } : {}),
+  const v = verdictFields(r, window);
+  // Waiting on a human outranks every other reading of this round: it explains why nothing is moving
+  // and what would unblock it.
+  if (!r.settled && ap.pending.length) {
+    v.note = `waiting on ${ap.pending.length} unanswered approval(s) - ${ap.pending.map((x) => x.toolName).join(', ')}; an unattended dispatch cannot proceed until a human answers in the dsh UI`;
+  }
+  return { ...r, ...ap, window, ...v,
     model: modelLabel(p?.modelSelection?.lastUsed || lastRound(s).pinned || s.pinned),
     tokenUsage: p?.tokenUsage || null, contextPressure: p?.contextPressure || null };
 }
 
-// A task that writes outside the session workspace is denied by dsh's sandbox, and the denial text
+// A task that WRITES outside the session workspace is denied by dsh's sandbox, and the denial text
 // ("escalation available - retry with sandbox_permissions") cannot be honoured by an unattended
 // dispatch: nobody is at the UI to approve it, so the round just burns quota and aborts. Refusing up
 // front is cheaper than a warning nobody reads - which is exactly what happened on 2026-10-18.
+// Merely naming a path is not writing it: the brief lives in the parent repo, the toolchain and the
+// skill definitions are outside every cwd, and refusing those would forbid the recommended shape.
+// Only the write tier blocks; the read tier travels as an advisory.
 function assertInsideCwd(task, dir, allowOutsideCwd) {
-  const outside = pathsOutsideCwd(task, dir);
-  if (!outside.length || allowOutsideCwd) return outside;
-  const e = new Error(`task names ${outside.length} path(s) outside the session workspace ${dir}: ${outside.join(' , ')}. dsh's sandbox will deny writes there and an unattended dispatch cannot approve the escalation. Re-launch with cwd set to the directory the task actually changes; pass allowOutsideCwd:true only if the task merely reads them.`);
-  e.detail = { cwd: dir, outsideCwd: outside };
+  const { all, write, read } = pathsOutsideCwd(task, dir);
+  if (!write.length || allowOutsideCwd) return { all, write, read };
+  const e = new Error(`task writes to ${write.length} path(s) outside the session workspace ${dir}: ${write.join(' , ')}. dsh's sandbox will deny writes there and an unattended dispatch cannot approve the escalation. Re-launch with cwd set to the directory the task actually changes; paths that are only read (skills, the ticket, another repo) do not need this - pass allowOutsideCwd:true if the classification is wrong.`);
+  e.detail = { cwd: dir, outsideCwd: { all, write, read } };
   throw e;
 }
 
@@ -506,7 +511,7 @@ tool('dsh_launch', {
     phase: z.string().optional(),
     group: z.boolean().optional().describe('default true: put the session in the sidebar group for this path; false leaves it Ungrouped'),
     dryRun: z.boolean().optional().describe('create + group + pin, dispatch nothing (spends no quota)'),
-    allowOutsideCwd: z.boolean().optional().describe('the task names paths outside cwd on purpose (read-only use); without it such a dispatch is refused, because dsh will deny the writes and nobody can approve the escalation'),
+    allowOutsideCwd: z.boolean().optional().describe('needed only when the task WRITES outside cwd; such a dispatch is refused without it because dsh will deny the writes and nobody can approve the escalation. Merely naming a path (the ticket, a skill file, another repo read) is not blocked - it is reported in outsideCwd.read'),
     ...modelParams,
   },
 }, async ({ alias, cwd, task, phase, model, reasoningEffort, group, dryRun, allowOutsideCwd }) => {
@@ -516,7 +521,7 @@ tool('dsh_launch', {
     const dir = checkCwd(cwd);
     const want = assertModelAllowed(model, reasoningEffort);
     const outside = assertInsideCwd(task, dir, allowOutsideCwd);
-    if (outside.length) log({ ev: 'cwd-advisory', alias, outside, allowed: true });
+    if (outside.all.length) log({ ev: 'cwd-advisory', alias, outside: outside.all, allowed: true });
     const sessionId = `dsh-${alias}`;
     const existing = readLedger()[alias];
     if (existing && normCwd(existing.cwd) !== normCwd(dir)) {
@@ -535,7 +540,7 @@ tool('dsh_launch', {
     if (dryRun) {
       return json({ ok: true, alias, sessionId, cwd: dir, grouped: !!ws, workspaceId: ws?.workspaceId || null,
         workspaceTitle: ws?.title || null, pinned, dispatched: false,
-        warnings: outside.length ? [`dispatched anyway because allowOutsideCwd:true - dsh's sandbox will deny writes to ${outside.join(' , ')}`] : [],
+        warnings: outside.write.length ? [`dispatched anyway because allowOutsideCwd:true - dsh's sandbox will deny writes to ${outside.write.join(' , ')}`] : [],
         outsideCwd: outside, scope: await sessionScope(sessionId),
         note: 'dry run: session created and grouped, nothing dispatched' });
     }
@@ -544,7 +549,7 @@ tool('dsh_launch', {
     await appendRound(alias, { ...roundRecord(res, pinned), task });
     return json({ ok: true, alias, sessionId, cwd: dir, grouped: !!ws, workspaceTitle: ws?.title || null,
       round: entry.rounds.length + 1, pinned, scope,
-      warnings: outside.length ? [`allowOutsideCwd:true - writes to ${outside.join(' , ')} will be denied by the sandbox`] : [],
+      warnings: outside.write.length ? [`allowOutsideCwd:true - writes to ${outside.write.join(' , ')} will be denied by the sandbox`] : [],
       outsideCwd: outside, ...res });
   } catch (e) { return fail(e); }
 });
@@ -552,7 +557,7 @@ tool('dsh_launch', {
 tool('dsh_send', {
   description: 'Dispatch the next task list into an existing alias (a new round of the same conversation). Re-pins only if you pass model/reasoningEffort.',
   inputSchema: { alias: z.string(), task: z.string(),
-    allowOutsideCwd: z.boolean().optional().describe('the task names paths outside the session workspace on purpose (read-only use)'),
+    allowOutsideCwd: z.boolean().optional().describe('needed only when the task WRITES outside the session workspace; read-only mentions of outside paths are reported, not blocked'),
     ...modelParams },
 }, async ({ alias, task, model, reasoningEffort, allowOutsideCwd }) => {
   try {
@@ -560,14 +565,14 @@ tool('dsh_send', {
     const s = regGet(alias);
     const want = assertModelAllowed(model, reasoningEffort);
     const outside = assertInsideCwd(task, s.cwd, allowOutsideCwd);
-    if (outside.length) log({ ev: 'cwd-advisory', alias, outside, allowed: true });
+    if (outside.all.length) log({ ev: 'cwd-advisory', alias, outside: outside.all, allowed: true });
     await ensureServer();
     const pinned = await pinModel(s.sessionId, want) || lastRound(s).pinned || s.pinned || null;
     const scope = await sessionScope(s.sessionId);
     const res = await dispatchRound(s.sessionId, task, `${alias}-r${(s.rounds || []).length + 1}-${Date.now().toString(36)}`);
     const rounds = await appendRound(alias, { ...roundRecord(res, pinned), task });
     return json({ ok: true, alias, sessionId: s.sessionId, round: rounds.length, pinned, scope,
-      warnings: outside.length ? [`allowOutsideCwd:true - writes to ${outside.join(' , ')} will be denied by the sandbox (session workspace is ${s.cwd})`] : [],
+      warnings: outside.write.length ? [`allowOutsideCwd:true - writes to ${outside.write.join(' , ')} will be denied by the sandbox (session workspace is ${s.cwd})`] : [],
       outsideCwd: outside, ...res });
   } catch (e) { return fail(e); }
 });
@@ -658,8 +663,10 @@ tool('dsh_status', {
 });
 
 tool('dsh_result', {
-  description: 'Audit payload for one round: assistant texts, the tool calls that produced them, failed tool bodies, files touched, turn outline. Reads that round from its own baseline and widens the window until the round\'s turn/end is inside it, so a settled round is never reported as idle and a later round is never mistaken for this one.',
-  inputSchema: { alias: z.string(), messages: z.number().int().min(1).max(40).default(14),
+  description: 'Audit payload for one round: every assistant text of that round, the tool calls that produced them, failed tool bodies, files touched, turn outline. Reads the round from its own baseline and walks the cursor forward until the round\'s own turn/end is collected, then cuts there - so a settled round is never reported as idle, and a later round is never mistaken for this one.',
+  inputSchema: { alias: z.string(),
+    messages: z.number().int().min(1).max(1000).default(24)
+      .describe('how many EVENTS the first page reads; the walk keeps paging to this round\'s turn/end regardless, and the answer contains the whole round either way, so raising only this changes cost/latency, not completeness'),
     round: z.number().int().min(1).optional().describe('audit an earlier round instead of the latest') },
 }, async ({ alias, messages, round }) => {
   try {
@@ -672,12 +679,9 @@ tool('dsh_result', {
     const { events, window } = await readRoundEvents(s.sessionId, target.sinceSeq ?? 0, { walk: true, first: messages });
     const p = await projections(s.sessionId).catch(() => null);
     const r = interpret(events, (await liveRow(s.sessionId))?.running ?? null);
-    const unseen = !r.settled && window?.truncated;
     if (r.settled && target.outcome !== r.state) await refreshOutcome(alias, target.requestId, r.state);
     return json({ ok: true, alias, round: round || rounds.length, requestId: target.requestId || null,
-      correlated: target.correlated ?? null, window, windowTruncated: !!window?.truncated,
-      verdictComplete: r.settled || !unseen,
-      ...(unseen ? { note: `no turn/end inside seq ${window.sinceSeq}..${window.throughSeq} of ${window.asOfSeq}; state is not a verdict` } : {}),
+      correlated: target.correlated ?? null, window, ...verdictFields(r, window),
       model: modelLabel(p?.modelSelection?.lastUsed || target.pinned || s.pinned),
       tokenUsage: p?.tokenUsage || null, ...r,
       assistantTexts: events.filter((e) => e.type === 'assistant/message')

@@ -39,7 +39,8 @@
 - `state:"idle"` 意味着本轮没有记录任何 turn（任务被吞或接管被拒），必须按"未验证"处理。
 - `state:"error"` 时读 `error.{code,message}` 原文上报，**不要**擅自降级到别的模型重跑。
 - `dsh_result` 里的 `correlated:false` 表示本轮基线是靠游标推断而非按 `requestId` 关联得到的，此时结论可信度下降，验收要叠加磁盘级证据。
-- `verdictComplete:false`（配合 `windowTruncated:true`）表示**桥接没读到本轮的 `turn/end`**，不等于"本轮没结束"。此时不要下任何结论，先用 `dsh_result` 重读（它会沿游标走到本轮判决为止）。
+- `verdictComplete` 只有一个含义：**本轮自己的 `turn/end` 已经读到**（等价于 `settled`）。它不与窗口覆盖度做或运算——正在正常执行、日志恰好读完的一轮，`verdictComplete` 必须是 `false`。
+- 落不到判决时区分两种情况：`windowTruncated:true` = **还没读到日志末尾**，别下结论，用 `dsh_result` 重读；`logExhausted:true` 且 `state:"idle"` = **日志已到末尾而本轮没有 `turn/start`/`turn/end`**，即派单没有被接手，按未验证处理。
 - `abortReason:"user"` 表示是人中止的（通常就是编排方自己调了 `dsh_cancel`），不是 dsh 放弃；两者处置完全不同。
 - `pending` 非空表示**本轮停在人工审批上**，`dsh_wait` 会立刻返回而不是耗完窗口。无人值守时它不会自己好：要么让人去 dsh UI 回答，要么把会话档位提到 `danger-full-access`（审批策略随之变 `never`）再重发。**不要**继续 `dsh_wait` 空转，也不要把它当成 dsh 卡死。
 - 单次 `dsh_wait` 不要超过客户端的 `tool_timeout_sec`（默认建议 45s）；没落定就继续调用，而不是一次拉长。
@@ -77,8 +78,9 @@
 ## 9. 权限与沙箱
 
 - **会话的写入边界就是它的 `cwd`**，档位默认 `workspace-write`。任务要改哪个目录，就用那个目录建会话；侧边栏分栏跟随 `cwd`，不需要事后搬。
-- 桥接**拒绝**下发"任务文本里出现工作区外绝对路径"的派单，除非显式传 `allowOutsideCwd:true`（只读引用才该这么用）。这条硬阻断存在的原因：dsh 拒绝写入后给出的"可提权重试"提示，在无人值守场景里没有人能兑现，那一轮只会白烧额度。
+- 桥接只**拒绝"要往工作区外面写"的派单**，判定按路径附近的意图词（写入/生成/补测试/实现…，含"在 X 里改"这种动词后置的中文写法）分级，结果在返回里分两档给出：`outsideCwd.write`（会被沙箱拒，硬阻断，需 `allowOutsideCwd:true` 才放行）与 `outsideCwd.read`（只是提到，仅告警）。**"提到路径"不等于"写路径"**：工单正文常在父仓、技能定义在 `~/.agents/skills`、工具在 `Program Files`，把这些也一并拒掉会让"正文只读放主仓、产物写 worktree"这个推荐写法无法下发。分级是启发式：判错方向时用 `allowOutsideCwd` 显式放行，别改桥。
 - **`workspace-write` 不等于无人值守可用。** 实测（2026-10-18）：即便工作目录已授权，`pwsh` / git 这类操作仍会触发 `approval/asked` 并停在人身上，`session/list.running` 还是 `true`，看起来只是"跑得慢"。要真正无人值守，需要会话处于 `danger-full-access`（审批策略随之变 `never`）——所以"睡觉或外出时才开 full"是权宜之计，不是配置疏漏。派单前用 `dsh_status {alias}` 看 `approvalPolicy` 与 `unattended`，别等一轮白烧完才发现。
+- **要求 `git commit` 的任务在 `workspace-write` 下结构性不可行。** git worktree 的索引与对象元数据不在 checkout 里，而在主仓的 `.git/worktrees/<name>/`（git 自身的目录布局），会话工作区之外 → 每次提交都会弹审批。所以：**凡派单里要求提交，要么下发前由人把会话切到 `danger-full-access`，要么让执行者只产出改动、由会话外的人提交**。把这条写进任务模板的边界段，别让每一轮执行者各自重撞一次。
 - **提权是人的动作，不是编排动作。** `/api` 上没有 per-session 的档位写入口（`permissionPresets/set`、`session/setSandboxMode` 均未转发），桥接也刻意不接 `commands/execute`。用 `dsh_permissions {alias}` 只读确认生效档位与提权痕迹（`escalated` / `escalatedBy` / `approvals`）。
 - **提权前后两轮不可互相取证**：一轮在 `workspace-write` 下失败、随后人工切到 `danger-full-access` 再跑，后者的"成功"不能证明前者是任务问题。审计时把档位变化写进结论。
 - 任务包里要显式规定临时文件位置：`run_code` 的进程环境被 dsh 清空，`os.tmpdir()` 会拼出 `<cwd>\undefined\temp` 而 ENOENT，写真 `%TEMP%` 又被沙箱拒绝。写成"临时文件放在会话工作区内的绝对路径"即可绕开。

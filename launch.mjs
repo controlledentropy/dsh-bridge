@@ -4,12 +4,12 @@
 // only break one place. Every path is resolved or overridable; nothing here hardcodes a package's
 // internal file layout.
 //
-//   node launch.mjs resolve | check | status | start | stop | doctor
+//   node launch.mjs resolve | check | status | start | stop | doctor | lock-acl
 import fs from 'node:fs';
 import path from 'path';
 import { fileURLToPath } from 'node:url';
 import net from 'node:net';
-import { spawn } from 'node:child_process';
+import { spawn, execFileSync } from 'node:child_process';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 
@@ -208,6 +208,50 @@ export async function stop() {
   return { ok: !(await portOpen()), stoppedPid: mine.pid };
 }
 
+// Windows: fs.chmodSync(0o600) does nothing - POSIX mode bits are not enforced there (measured: the
+// capture file stays 0o666 after chmod, and its ACEs are simply inherited from the directory). The
+// capture file holds the owner launch token, which is a bearer credential for the whole instance, so
+// "who can read this file" is the real security boundary and it has to be read from the ACL.
+const TRUSTED_ACE = /^(nt authority\\system|builtin\\administrators|nt authority\\authenticated users)$/i;
+export function tokenAcl(file = OUT_FILE) {
+  if (process.platform !== 'win32') {
+    const m = fs.existsSync(file) ? (fs.statSync(file).mode & 0o777).toString(8) : null;
+    return { platform: process.platform, checked: !!m, file, mode: m, others: m ? (parseInt(m, 8) & 0o077) !== 0 : false };
+  }
+  if (!fs.existsSync(file)) return { platform: 'win32', checked: false, file, reason: 'capture file does not exist yet' };
+  let text = '';
+  try { text = execFileSync('icacls', [file], { encoding: 'utf8', windowsHide: true, timeout: 8000 }); }
+  catch (e) { return { platform: 'win32', checked: false, file, reason: `icacls unavailable: ${e.message || e}` }; }
+  const me = String(process.env.USERNAME || process.env.LOGONUSER || '').toLowerCase();
+  // icacls prints "C:\path\file DOMAIN\User:(I)(RX)" on the first line, so the file name has to come
+  // off before the principal can be read - otherwise the concern text quotes a path as a username.
+  const stripFile = (l) => (l.slice(0, file.length).toLowerCase() === file.toLowerCase() ? l.slice(file.length) : l).trim();
+  const aces = text.split(/\r?\n/).map((l) => stripFile(l))
+    .filter((l) => /:(\(|I)/.test(l))
+    .map((l) => { const i = l.indexOf(':('); return { principal: l.slice(0, i).trim(), rights: l.slice(i + 1) }; });
+  const foreign = aces.filter((a) => {
+    const p = a.principal.toLowerCase();
+    if (TRUSTED_ACE.test(p) || /(^|\\)administrators$/i.test(p)) return false;
+    if (me && (p === me || p.endsWith('\\' + me))) return false;
+    return /[rR]/.test(a.rights);                       // any principal other than those above that can READ
+  });
+  return { platform: 'win32', checked: true, file, aces, foreignReaders: foreign,
+    concerns: foreign.map((f) => `${f.principal} can read the launch token (${f.rights})`) };
+}
+
+// Opt-in only: rewriting a file's ACL removes inherited grants, and on a machine where another
+// principal legitimately needs the file (a second account, a service) that is the operator's call.
+export function lockTokenAcl(file = OUT_FILE) {
+  if (process.platform !== 'win32') return { ok: false, error: 'lock-acl is a Windows NTFS operation' };
+  if (!fs.existsSync(file)) return { ok: false, error: `no such file: ${file}` };
+  const me = process.env.USERNAME || (process.env.LOGONUSER || '').split('\\').pop();
+  if (!me) return { ok: false, error: 'cannot determine the current username to grant' };
+  try {
+    execFileSync('icacls', [file, '/inheritance:r', '/grant:r', `${me}:F`], { encoding: 'utf8', windowsHide: true, timeout: 15000 });
+  } catch (e) { return { ok: false, error: `icacls failed: ${e.message || e}`, file }; }
+  return { ok: true, file, grantedTo: me, after: tokenAcl(file) };
+}
+
 // One-shot health report with an explicit conclusion.
 export async function doctor() {
   const c = await check();
@@ -229,6 +273,10 @@ export async function doctor() {
     }
     if (!out.env.temp) out.env.problems.push('neither TEMP nor TMP is set: tools that resolve a temp dir will build a relative path and fail with ENOENT');
   }
+  // chmod(0o600) is a no-op on Windows, so the bearer-token file keeps whatever its directory
+  // inherits. Say who can actually read it instead of implying an assurance the OS does not give.
+  out.acl = tokenAcl();
+  if (out.acl.concerns?.length) out.env.problems.push(...out.acl.concerns.map((x) => `token file ACL: ${x}`));
   if (st.listening && out.tokenCaptured) {
     try {
       const r = await fetch(`http://${HOST}:${PORT}/connect?token=${currentToken()}&interactions=answer`, { redirect: 'manual', signal: AbortSignal.timeout(8000) });
@@ -266,6 +314,7 @@ if (process.argv[1] && process.argv[1].endsWith('launch.mjs')) {
     : cmd === 'doctor' ? await doctor()
     : cmd === 'start' ? await start()
     : cmd === 'stop' ? await stop()
+    : cmd === 'lock-acl' ? lockTokenAcl(process.argv[3] || OUT_FILE)
     : resolveDsh();
   console.log(JSON.stringify(out, null, 1));
   process.exit(out && out.ok === false ? 1 : 0);
