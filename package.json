@@ -39,7 +39,7 @@
     "README.md"
   ],
   "scripts": {
-    "test": "node --test tests/contract.test.mjs tests/mcp.test.mjs tests/remote-surface.test.mjs",
+    "test": "node --test tests/audit-log.test.mjs tests/contract.test.mjs tests/ledger-store.test.mjs tests/mcp.test.mjs tests/remote-surface.test.mjs",
     "preflight": "node launch.mjs check",
     "surface": "node tools/remote-surface.mjs",
     "surface:check": "node tools/remote-surface.mjs --check",

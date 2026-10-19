@@ -292,7 +292,7 @@ DSH_NO_SPAWN = '1'
 - [ ] `dsh web` 仅供可信本机程序连接；不对公网暴露 owner 凭据或本机 API。
 - [ ] `DSH_BRIDGE_STATE`（含保留完整任务文本的 `sessions.json`）和 stdout 捕获文件只对授权用户可读；**Windows 上 `chmod` 不生效**，用 `node launch.mjs doctor` 读实际 ACL（`acl.foreignReaders`），必要时 `node launch.mjs lock-acl`。
 - [ ] 同一状态目录由需要共享别名的客户端共同使用；不同环境使用不同状态目录。
-- [ ] 同一个别名不会被两个客户端**同时派发**任务。账本写入是原子的（临时文件 + rename），但**并发读改写仍可能让后写者覆盖前者的轮次记录**——拿锁超时时桥选择"照样写并记一条 `ledger-lock-timeout`"，而不是丢掉已派发任务的句柄。所以并发安全指"不会写出半个文件"，不保证"多轮并发语义正确"。
+- [ ] 同一个别名不会被两个客户端**同时派发**任务（一轮只应有一个在途 prompt）。账本每次写入都会"读—改—写—读回确认"，被并发覆盖时自动重试，重试仍不确认就返回 `ledgerAtRisk:true` 与轮次句柄（见 `docs/ORCHESTRATION.md` §8）——但**不要**把这当作可以并发派同一别名的许可。
 - [ ] 所有下发任务使用可写、可回滚的工作区，并由调用方审查结果。
 - [ ] 变更 `dsh` 版本、profile 或 MCP 配置后，重新运行预检和连通性验证。
 
@@ -313,7 +313,7 @@ node launch.mjs stop        # 仅停止桥接记录为自己管理的实例
 ### 契约测试与诊断工具
 
 ```bash
-npm test                                  # 34 个离线契约 / 远端面解析 / MCP 子进程测试
+npm test                                  # 46 个离线测试：契约 / 远端面解析 / 账本存储 / 审计日志 / MCP 子进程
 node tests/live-check.mjs                 # 已运行实例的只读复验（需能读取当前实例的启动 token）
 node tools/remote-surface.mjs             # 从本机 dsh 包重新生成 docs/REMOTE-SURFACE.md（135 个可转发方法）
 node tools/remote-surface.mjs --check     # 只比对：升级后方法表与文档是否漂移（退出码非 0 即漂移）

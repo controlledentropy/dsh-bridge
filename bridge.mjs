@@ -33,6 +33,8 @@ import { ARGS, envelope, authCookie, pastCursor, parseAllowlist, allowedText, ch
   checkAlias, checkCwd, normCwd, roundRecord, baselineFrom, interpret, modelLabel,
   unwrapProjections, pathsOutsideCwd, pageWindow as calcWindow, permissionHistory, walkRound,
   approvalState, verdictFields, humanWaits, modelEfforts, PAGE_SIZE, MAX_PAGES } from './lib/api-contract.mjs';
+import { createLedgerStore, pushRound, LedgerUnconfirmed } from './lib/ledger-store.mjs';
+import { createAuditLog } from './lib/audit-log.mjs';
 
 const num = (name, value, fallback) => {
   const n = Number(value);
@@ -63,16 +65,12 @@ fs.mkdirSync(STATE_DIR, { recursive: true });
 
 const PID = process.pid;
 const LOG_MAX_BYTES = num('DSH_LOG_MAX_BYTES', process.env.DSH_LOG_MAX_BYTES, 2_000_000);
-let logDisabled = false;
-// Diagnostics must never fail a tool call, and never grow without bound: Codex spawns a bridge
-// process per tool call, so an unguarded append turns into an unbounded file.
-function log(o) {
-  if (logDisabled) return;
-  try {
-    if (fs.statSync(LOG_FILE).size > LOG_MAX_BYTES) fs.renameSync(LOG_FILE, LOG_FILE + '.1');
-    fs.appendFileSync(LOG_FILE, JSON.stringify({ t: new Date().toISOString(), pid: PID, ...o }) + '\n');
-  } catch { logDisabled = true; }
-}
+// Diagnostics must never fail a tool call and must never grow without bound: an MCP client spawns a
+// bridge process per call, so an unguarded append becomes an unbounded file. Rotation is expected to
+// race between those processes - see lib/audit-log.mjs for why a lost race is not a reason to stop
+// writing the evidence trail. `audit` is reported by dsh_sessions so a blind process is visible.
+const audit = createAuditLog({ file: LOG_FILE, maxBytes: LOG_MAX_BYTES, pid: PID });
+const log = (o) => audit.write(o);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // An empty allowlist means "no pinning"; one that parses to nothing is a typo, so this throws at
@@ -86,61 +84,55 @@ const deny = (provider, model, effort, origin) => {
 };
 
 /* ------------------------------------------------------------------ ledger */
-const readLedger = () => { try { return JSON.parse(fs.readFileSync(REG_FILE, 'utf8')); } catch { return {}; } };
-function writeLedger(r) {
-  const tmp = `${REG_FILE}.${PID}.${Date.now().toString(36)}.tmp`;   // per-process name: no two writers share it
-  fs.writeFileSync(tmp, JSON.stringify(r, null, 2));
-  fs.renameSync(tmp, REG_FILE);                                      // atomic: a reader never sees a half file
-  try { fs.rmSync(tmp, { force: true }); } catch {}
+// Read-modify-write under an O_EXCL lock, plus the part the lock alone never gave: every write is
+// confirmed by reading it back and retried from fresh content (see lib/ledger-store.mjs). Losing a
+// dispatched round's handle is the worst failure available here, so an unconfirmable write becomes a
+// typed error carrying that handle instead of a quiet success.
+const ledgerStore = createLedgerStore({ file: REG_FILE, pid: PID, sleep, onEvent: (e) => log(e) });
+const readLedger = () => ledgerStore.read();
+// Post-dispatch, an unconfirmed ledger write is not the round's failure - the prompt already left. The
+// caller still has to see it, with the handle, because nothing else in dsh can hand the round back.
+function ledgerRiskFields(e, round = {}) {
+  return { ledgerAtRisk: true, ledgerNote: String(e.message),
+    unrecordedRound: { alias: e.detail?.alias ?? null, requestId: e.detail?.requestId ?? round.requestId ?? null,
+      sinceSeq: round.sinceSeq ?? null } };
 }
-// MEASURED: one Codex conversation spawns many short-lived bridge processes sharing this file, so
-// read-modify-write runs under an O_EXCL lock. A failed persist throws: losing the handle to a
-// session that is now running costs more than an error the caller can see.
-async function withLedger(mutate) {
-  const lockFile = REG_FILE + '.lock';
-  const deadline = Date.now() + 5000;
-  let held = false;
-  for (;;) {
-    try { const fd = fs.openSync(lockFile, 'wx'); fs.writeSync(fd, String(PID)); fs.closeSync(fd); held = true; break; }
-    catch (e) {
-      if (e.code !== 'EEXIST') throw e;
-      let age = Infinity;
-      try { age = Date.now() - fs.statSync(lockFile).mtimeMs; } catch { break; }
-      if (age > 15_000) { try { fs.rmSync(lockFile, { force: true }); } catch {} continue; }   // holder died
-      if (Date.now() >= deadline) { log({ ev: 'ledger-lock-timeout' }); break; }               // best effort; writes stay atomic
-      await sleep(120);
-    }
-  }
-  try { writeLedger(mutate(readLedger())); } finally {
-    if (held) { try { fs.rmSync(lockFile, { force: true }); } catch {} }
+async function recordRound(alias, round) {
+  try { return { rounds: await appendRound(alias, round), risk: null }; }
+  catch (e) {
+    if (!(e instanceof LedgerUnconfirmed)) throw e;
+    log({ ev: 'ledger-at-risk', alias, requestId: round.requestId });
+    return { rounds: null, risk: ledgerRiskFields(e, round) };
   }
 }
 async function upsertAlias(alias, patch) {
   let out = null;
-  await withLedger((r) => { r[alias] = { ...(r[alias] || {}), ...patch }; out = r[alias]; return r; });
+  await ledgerStore.transact((r) => { out = (r[alias] = { ...(r[alias] || {}), ...patch }); }, { label: 'upsert-alias', alias });
   return out;
 }
 async function appendRound(alias, round) {
   let out = null;
-  await withLedger((r) => {
+  await ledgerStore.transact((r) => {
     if (!r[alias]) throw new Error(`alias "${alias}" is not in the ledger`);
-    r[alias].rounds = r[alias].rounds || [];
-    r[alias].rounds.push(round);
-    out = r[alias].rounds;
-    return r;
-  });
+    out = pushRound(r, alias, round);
+  }, { label: 'append-round', alias, requestId: round.requestId });
   return out;
 }
 // MEASURED failure mode: a round persisted as "running" stayed that way forever even though its
 // turn/end (aborted) was on disk, so the ledger contradicted the log. A later read that does see the
-// verdict writes it back.
+// verdict writes it back. Bookkeeping only: the answer the caller is holding does not depend on it.
 async function refreshOutcome(alias, requestId, state) {
-  if (!requestId || !state) return;
-  await withLedger((r) => {
-    const round = (r[alias]?.rounds || []).find((x) => x.requestId === requestId);
-    if (round && round.outcome !== state) { round.outcome = state; log({ ev: 'outcome-refreshed', alias, requestId, state }); }
-    return r;
-  });
+  if (!requestId || !state) return null;
+  try {
+    await ledgerStore.transact((r) => {
+      const round = (r[alias]?.rounds || []).find((x) => x.requestId === requestId);
+      if (round && round.outcome !== state) { round.outcome = state; log({ ev: 'outcome-refreshed', alias, requestId, state }); }
+    }, { label: 'refresh-outcome', alias, requestId });
+    return null;
+  } catch (e) {
+    if (!(e instanceof LedgerUnconfirmed)) throw e;
+    const risk = ledgerRiskFields(e, { requestId }); log({ ev: 'ledger-at-risk', ...risk }); return risk;
+  }
 }
 function regGet(alias) {
   const s = readLedger()[alias];
@@ -593,9 +585,10 @@ tool('dsh_launch', {
     }
     const scope = await sessionScope(sessionId);
     const res = await dispatchRound(sessionId, task, `${alias}-r${entry.rounds.length + 1}-${Date.now().toString(36)}`);
-    await appendRound(alias, { ...roundRecord(res, pinned), task });
+    const rec = await recordRound(alias, { ...roundRecord(res, pinned), task });
     return json({ ok: true, alias, sessionId, cwd: dir, grouped: !!ws, workspaceTitle: ws?.title || null,
-      round: entry.rounds.length + 1, pinned, scope,
+      round: rec.rounds ? rec.rounds.length : entry.rounds.length + 1, pinned, scope,
+      ...(rec.risk || {}),
       warnings: outside.write.length ? [`allowOutsideCwd:true - writes to ${outside.write.join(' , ')} will be denied by the sandbox`] : [],
       outsideCwd: outside, ...res });
   } catch (e) { return fail(e); }
@@ -617,8 +610,9 @@ tool('dsh_send', {
     const pinned = await pinModel(s.sessionId, want) || lastRound(s).pinned || s.pinned || null;
     const scope = await sessionScope(s.sessionId);
     const res = await dispatchRound(s.sessionId, task, `${alias}-r${(s.rounds || []).length + 1}-${Date.now().toString(36)}`);
-    const rounds = await appendRound(alias, { ...roundRecord(res, pinned), task });
-    return json({ ok: true, alias, sessionId: s.sessionId, round: rounds.length, pinned, scope,
+    const rec = await recordRound(alias, { ...roundRecord(res, pinned), task });
+    return json({ ok: true, alias, sessionId: s.sessionId, round: rec.rounds ? rec.rounds.length : (s.rounds || []).length + 1,
+      pinned, scope, ...(rec.risk || {}),
       warnings: outside.write.length ? [`allowOutsideCwd:true - writes to ${outside.write.join(' , ')} will be denied by the sandbox (session workspace is ${s.cwd})`] : [],
       outsideCwd: outside, ...res });
   } catch (e) { return fail(e); }
@@ -681,9 +675,9 @@ tool('dsh_wait', {
       await sleep(CFG.pollMs);
       r = await readRound(s);
     }
-    if (r.settled) await refreshOutcome(alias, lastRound(s).requestId, r.state);
+    const bookkeeping = r.settled ? await refreshOutcome(alias, lastRound(s).requestId, r.state) : null;
     return json({ ok: true, alias, round: (s.rounds || []).length, requestId: lastRound(s).requestId || null,
-      waitedMs: Date.now() - started, ...r });
+      waitedMs: Date.now() - started, ...(bookkeeping || {}), ...r });
   } catch (e) { return fail(e); }
 });
 
@@ -731,8 +725,10 @@ tool('dsh_result', {
     const { events, window } = await readRoundEvents(s.sessionId, target.sinceSeq ?? 0, { walk: true, first: messages });
     const p = await projections(s.sessionId).catch(() => null);
     const r = interpret(events, (await liveRow(s.sessionId))?.running ?? null);
-    if (r.settled && target.outcome !== r.state) await refreshOutcome(alias, target.requestId, r.state);
+    const bookkeeping = (r.settled && target.outcome !== r.state)
+      ? await refreshOutcome(alias, target.requestId, r.state) : null;
     return json({ ok: true, alias, round: round || rounds.length, requestId: target.requestId || null,
+      ...(bookkeeping || {}),
       correlated: target.correlated ?? null, window, ...verdictFields(r, window),
       model: modelLabel(p?.modelSelection?.lastUsed || target.pinned || s.pinned),
       tokenUsage: p?.tokenUsage || null, ...r,
@@ -753,9 +749,9 @@ tool('dsh_sessions', {
     const owned = Object.entries(readLedger()).map(([alias, s]) => ({ alias, sessionId: s.sessionId, cwd: s.cwd,
       phase: s.phase || null, workspaceTitle: s.workspaceTitle || null, grouped: !!s.workspaceId,
       pinned: s.pinned || null, rounds: (s.rounds || []).length, lastOutcome: lastRound(s).outcome || null }));
-    if (!cwd) return json({ ok: true, owned });
+    if (!cwd) return json({ ok: true, owned, logging: audit.status() });
     const v = await call('session/list', ARGS.sessionList());
-    return json({ ok: true, owned,
+    return json({ ok: true, owned, logging: audit.status(),
       liveInCwd: (v?.items || []).filter((i) => normCwd(i.cwd) === want)
         .map((i) => ({ sessionId: i.sessionId, running: !!i.running, blank: !!i.blank })),
       note: `total sessions across all workspaces: ${v?.items?.length ?? '?'}` });

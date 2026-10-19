@@ -75,7 +75,9 @@
 
 - 明确要停：`dsh_cancel {alias}`。它返回的 `accepted` 只是受理，要用 `dsh_wait` 复查是否真的落到 `aborted` / `idle`。
 - 桥接连不上（`unreachable` / `no launch token` / `/connect -> HTTP …`）属于**环境问题**：先跑 `node launch.mjs doctor`，把它的 `broken` 与 `problems` 原文带回来再决定处置（多半是"没有实例在跑"或"实例的 stdout 没被捕获"）。不要改成自己做然后声称外派过了，也不要凭猜测改配置。
-- 升级 dsh 之后：先 `node launch.mjs check`（不启动进程就能暴露版本不一致与 profile 配置被拒两类问题），再 `doctor`，再 `npm test`，最后**复核 `DSH_ALLOWED_MODELS` 是否仍符合预期**——修复一个配置缺陷可能同时扩大可选模型集。
+- 升级 dsh 之后：先 `node launch.mjs check`（不启动进程就能暴露版本不一致与 profile 配置被拒两类问题），再 `doctor`，再 `npm test`，再 `node tools/remote-surface.mjs --check`（方法表漂移），最后**复核 `DSH_ALLOWED_MODELS` 是否仍符合预期**——修复一个配置缺陷可能同时扩大可选模型集。
+- **账本写不进时会明说，不会假装成功。** 每次写 `sessions.json` 都是"读—改—写—读回确认"，被别的进程盖掉就重试；确认不了时派发类调用返回 `ledgerAtRisk:true` + `ledgerNote` + `unrecordedRound{alias,requestId,sinceSeq}`（**轮次已经发出去了**，句柄在回复里，可据此 `dsh_adopt` 找回），审计类调用只附带同样字段而不失败。看到 `ledgerAtRisk` 就不要把这一轮当作已登记：先把句柄补记，再往下走。
+- **审计日志可能变聋，但要看得见。** `bridge.log.jsonl` 超预算会轮转，多进程抢同一次轮转是正常竞态（丢了 rename 的一方继续写新文件，不静默停写）；只有**连续**真实写失败才停用日志，并在 stderr 说一次。状态由 `dsh_sessions` 的 `logging{disabled,failures,rotationRaces,written}` 报出——`disabled:true` 意味着该进程从此没有本地证据，别把它当成"没发生"。
 
 ## 9. 权限与沙箱
 
