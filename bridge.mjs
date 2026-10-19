@@ -249,11 +249,11 @@ async function asOf(sessionId) { try { return (await projections(sessionId))?.as
 // (measured: policy flipped at seq 706, a 200-event tail started at 884 -> reported null, which reads
 // as "ask" and would wrongly rule out unattended dispatch). So scan backwards until one turns up;
 // policy changes are rare, and finding none is reported as null rather than guessed.
-async function currentApprovalPolicy(sessionId) {
-  let asOfSeq = await asOf(sessionId);
+async function currentApprovalPolicy(sessionId, asOfHint = null) {
+  let asOfSeq = Number.isFinite(asOfHint) && asOfHint > 0 ? asOfHint : await asOf(sessionId);
   for (let page = 0; page < MAX_PAGES && asOfSeq > 0; page++) {
     const from = Math.max(-1, asOfSeq - PAGE_SIZE);
-    const { events } = await pageWindow(sessionId, from, PAGE_SIZE).catch(() => ({ events: [] }));
+    const { events } = await pageWindow(sessionId, from, PAGE_SIZE, 'baseline', asOfSeq).catch(() => ({ events: [] }));
     const policies = events.filter((e) => e?.type === 'approval/policy');
     if (policies.length) return policies[policies.length - 1].data?.policy ?? null;
     if (from <= 0) break;
@@ -262,9 +262,11 @@ async function currentApprovalPolicy(sessionId) {
   return null;
 }
 
-async function sessionScope(sessionId) {
-  const p = await projections(sessionId).catch(() => null);
-  const policy = await currentApprovalPolicy(sessionId).catch(() => null);
+// `hints.p` / `hints.asOfSeq` let one tool call reuse the projections read it already did; without them
+// a single dsh_status paid for the same snapshot three times.
+async function sessionScope(sessionId, hints = {}) {
+  const p = hints.p ?? await projections(sessionId).catch(() => null);
+  const policy = await currentApprovalPolicy(sessionId, hints.asOfSeq ?? p?.asOfSeq ?? null).catch(() => null);
   return { workingDirectory: p?.workingDirectory || null, sandbox: p?.permissions?.currentValue || null,
     agentPreset: p?.agentPreset || null, model: modelLabel(p?.modelSelection?.lastUsed),
     approvalPolicy: policy, unattended: policy === 'never' };
@@ -278,9 +280,13 @@ async function sessionScope(sessionId) {
 // the round's turn/end - and an aborted round then reports state "idle", i.e. "nothing happened",
 // which is the exact false negative the state machine exists to prevent. 'tail' is only for "what is
 // this session doing right now" (adoption previews).
-async function pageWindow(sessionId, sinceSeq, maxMessages = 20, anchored = 'baseline') {
-  let asOfSeq = await asOf(sessionId);
-  if (!asOfSeq) return { events: [], window: { sinceSeq: sinceSeq || 0, throughSeq: 0, asOfSeq: 0, anchored, truncated: false },
+// `asOfHint` lets one caller reuse a single cursor snapshot across pages instead of paying a
+// session/projections round trip per page (measured: one dsh_status cost 10-13 /api calls, most of them
+// re-reading the same cursor). A hint is only ever a starting point: "past cursor N" still corrects it
+// below, and the corrected value travels back out through window.asOfSeq.
+async function pageWindow(sessionId, sinceSeq, maxMessages = 20, anchored = 'baseline', asOfHint = null) {
+  let asOfSeq = Number.isFinite(asOfHint) && asOfHint > 0 ? asOfHint : await asOf(sessionId);
+  if (!asOfSeq) return { events: [], window: { sinceSeq: sinceSeq || 0, throughSeq: 0, asOfSeq: 0, anchored, truncated: false, reachedLogEnd: false },
     note: 'no readable log yet (asOfSeq=0)' };
   let w = calcWindow({ sinceSeq: sinceSeq || 0, asOfSeq, maxMessages, anchored });
   for (let attempt = 0; attempt < 3; attempt++) {
@@ -318,8 +324,18 @@ const dropListCache = () => { listCache = { at: 0, items: null }; };
 // a 1000-message window from the baseline stopped at 1004 - a COMPLETED round read back as "idle").
 // The walk itself is pure logic in the contract lib and is tested offline; this is only the network
 // page reader it walks over. `walk:false` keeps polling cheap: one small window, no verdict guarantee.
-const readRoundEvents = (sessionId, sinceSeq, opts) =>
-  walkRound((cursor, n) => pageWindow(sessionId, cursor, n), sinceSeq, opts);
+// The walk takes ONE cursor snapshot up front. That is deliberate, not just cheap: a settled round's
+// turn/end is already in the log, so following live growth page by page only buys reads past the very
+// event being looked for. If the snapshot stops the walk short, walkRound reports truncated +
+// verdictComplete:false, which is the honest answer and tells the caller to re-read.
+async function readRoundEvents(sessionId, sinceSeq, opts = {}) {
+  let snapshot = Number.isFinite(opts.asOfSeq) && opts.asOfSeq > 0 ? opts.asOfSeq : await asOf(sessionId);
+  return walkRound(async (cursor, n) => {
+    const w = await pageWindow(sessionId, cursor, n, 'baseline', snapshot);
+    if (w.window?.asOfSeq) snapshot = w.window.asOfSeq;    // a pastCursor correction outranks our guess
+    return w;
+  }, sinceSeq, opts);
+}
 
 async function readRound(s, opts = {}) {
   const sinceSeq = lastRound(s).sinceSeq ?? 0;
@@ -328,8 +344,8 @@ async function readRound(s, opts = {}) {
   // actually possible, otherwise every poll re-reads a thousand events.
   const settledHint = row?.running === false;
   const { events, window } = await readRoundEvents(s.sessionId, sinceSeq,
-    { walk: opts.walk ?? settledHint, first: opts.first ?? 24 }).catch(() => ({ events: [], window: { sinceSeq, truncated: false } }));
-  const p = await projections(s.sessionId).catch(() => null);
+    { walk: opts.walk ?? settledHint, first: opts.first ?? 24, asOfSeq: opts.asOfSeq }).catch(() => ({ events: [], window: { sinceSeq, truncated: false } }));
+  const p = opts.p ?? await projections(s.sessionId).catch(() => null);
   const r = interpret(events, row?.running ?? null);
   const ap = approvalState(events);
   const v = verdictFields(r, window);
@@ -653,10 +669,14 @@ tool('dsh_status', {
     const s = regGet(alias);                             // a wrong alias is refused without waking dsh
     await ensureServer();
     const p = await projections(s.sessionId).catch(() => null);
+    // One projections read per tool call, shared three ways: sessionScope, readRound and the walk's
+    // cursor snapshot. (Measured before: dsh_status paid 10-13 /api calls, most re-reading the same
+    // session/projections answer.)
+    const hints = { p, asOfSeq: p?.asOfSeq };
     // The policy in effect NOW, not the one this round's events happen to contain: a human may have
     // escalated after the round ended, and "can I dispatch unattended" is about the present.
-    const scope = await sessionScope(s.sessionId).catch(() => null);
-    return json({ ok: true, alias, round: (s.rounds || []).length, ...await readRound(s),
+    const scope = await sessionScope(s.sessionId, hints).catch(() => null);
+    return json({ ok: true, alias, round: (s.rounds || []).length, ...await readRound(s, hints),
       approvalPolicy: scope?.approvalPolicy ?? null, unattended: scope?.unattended ?? null,
       plan: p?.plan, userQuestions: p?.userQuestions, workingDirectory: p?.workingDirectory,
       sandbox: p?.permissions?.currentValue || null, permissions: p?.permissions || null,
