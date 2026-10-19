@@ -282,7 +282,11 @@ export async function start({ quiet = false } = {}) {
     if (fatal.length) return { ok: false, error: 'pre-flight failed: ' + fatal.join(' | ') };
     mkdirs();
     const fd = fs.openSync(OUT_FILE, 'w');
-    const cp = childPath(process.env, String(process.env.DSH_EXTRA_PATH || '').split(path.delimiter));
+    // The node that will actually run the instance is resolved absolutely (c.node), and its siblings -
+    // npm.cmd, npx.cmd, corepack.cmd - are exactly what the UI shells out to. MEASURED on this machine:
+    // neither the node install dir nor %APPDATA%\npm is on the agent shell's PATH, so an instance booted
+    // from here saw neither; git came from a MinGW dir that did happen to be on PATH.
+    const cp = childPath(process.env, [path.dirname(c.node), ...String(process.env.DSH_EXTRA_PATH || '').split(path.delimiter)]);
     const toolchain = resolveToolchain(cp.path);
     let pid = 0;
     try {

@@ -254,7 +254,7 @@ dsh_status {alias}                 查看模型、token 用量和上下文压力
 | `DSH_NO_SPAWN` | 空 | 设为 `1` 后禁止桥接自动启动 `dsh web` |
 | `DSH_AUTO_GROUP` | 空 | 设为 `0` 时默认关闭自动侧边栏分栏；单次调用还可设置 `group: false` |
 | `DSH_NODE` / `DSH_PKG_DIR` | 自动探测 | 覆盖 Node 可执行文件和 `@deepseek-ai/dsh` 包目录 |
-| `DSH_EXTRA_PATH` | 空 | 追加到**实例进程** PATH 前面的目录（分隔符拼接）。npm 全局 bin 目录已经自动补上；当 `pnpm`/`git` 装在别处、而 dsh 的 UI 要用它们时（安装插件、git 类操作），用这个变量指过去。取值以启动 `launch.mjs start` 的那个环境为准 |
+| `DSH_EXTRA_PATH` | 空 | 追加到**实例进程** PATH 前面的目录（分隔符拼接）。npm 全局 bin 目录与所用 Node 的所在目录（`npm.cmd`/`npx.cmd`/`corepack.cmd` 就在它旁边）已经自动补上；当 `pnpm`/`git` 装在别处、而 dsh 的 UI 要用它们时（安装插件、git 类操作），用这个变量指过去。取值以启动 `launch.mjs start` 的那个环境为准 |
 
 ### 模型访问策略
 
