@@ -63,7 +63,7 @@ test('handshake, instructions and the full tool surface', async (t) => {
       }
       const launch = tools.find((x) => x.name === 'dsh_launch');
       assert.deepEqual(Object.keys(launch.inputSchema.properties).sort(),
-        ['alias', 'allowOutsideCwd', 'cwd', 'dryRun', 'group', 'model', 'phase', 'reasoningEffort', 'task'].sort(),
+        ['alias', 'allowOutsideCwd', 'cwd', 'dryRun', 'group', 'model', 'phase', 'reasoningEffort', 'supersedes', 'task'].sort(),
         'dsh_launch keeps every declared parameter');
       assert.ok((launch.inputSchema.required || []).includes('alias'));
       assert.match(client.getInstructions(), /trust "state"/, 'instructions state that acceptance is not completion');
@@ -89,6 +89,8 @@ test('every pre-flight refusal happens before dsh is touched', async () => {
         // The 2026-10-18 incident: a task aimed at another repository, dispatched into a session bound
         // to a different workspace, is denied by dsh's sandbox and burns a whole round. Refuse it here.
         ['dsh_launch', { alias: 'ok', cwd: ws.cwd, task: `在 ${ws.sibling} 里实现并跑测试` }, /outside the session workspace/],
+        // supersedes names an alias, so a typo is refused before any side effect - not after a session exists
+        ['dsh_launch', { alias: 'ok', cwd: ws.cwd, task: 'x', supersedes: 'never-existed' }, /not in the ledger/],
         ['dsh_send', { alias: 'never-created', task: 'x' }, /unknown alias/],
         ['dsh_adopt', { alias: 'ok', sessionId: 's', cwd: ws.cwd, model: 'deepseek-account/deepseek-v4-pro' }, /not permitted/],
         ['dsh_adopt', { alias: 'bad alias!', sessionId: 's', cwd: ws.cwd }, /must match/],

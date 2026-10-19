@@ -35,6 +35,7 @@ import { ARGS, envelope, authCookie, pastCursor, parseAllowlist, allowedText, ch
   approvalState, verdictFields, humanWaits, modelEfforts, PAGE_SIZE, MAX_PAGES } from './lib/api-contract.mjs';
 import { createLedgerStore, pushRound, LedgerUnconfirmed } from './lib/ledger-store.mjs';
 import { createAuditLog } from './lib/audit-log.mjs';
+import { findSiblings, applySupersedes } from './lib/alias-hygiene.mjs';
 
 const num = (name, value, fallback) => {
   const n = Number(value);
@@ -551,9 +552,10 @@ tool('dsh_launch', {
     group: z.boolean().optional().describe('default true: put the session in the sidebar group for this path; false leaves it Ungrouped'),
     dryRun: z.boolean().optional().describe('create + group + pin, dispatch nothing (spends no quota)'),
     allowOutsideCwd: z.boolean().optional().describe('needed only when the task WRITES outside cwd; such a dispatch is refused without it because dsh will deny the writes and nobody can approve the escalation. Merely naming a path (the ticket, a skill file, another repo read) is not blocked - it is reported in outsideCwd.read'),
+    supersedes: z.string().optional().describe('the alias this new one takes over (e.g. re-dispatching the same ticket into the correct cwd). Records the handover on both sides, so a later round cannot be sent into the replaced session by mistake.'),
     ...modelParams,
   },
-}, async ({ alias, cwd, task, phase, model, reasoningEffort, group, dryRun, allowOutsideCwd }) => {
+}, async ({ alias, cwd, task, phase, model, reasoningEffort, group, dryRun, allowOutsideCwd, supersedes }) => {
   try {
     log({ ev: 'tool', tool: 'dsh_launch', alias, cwd });
     checkAlias(alias);
@@ -561,6 +563,15 @@ tool('dsh_launch', {
     const want = assertModelAllowed(model, reasoningEffort);
     const outside = assertInsideCwd(task, dir, allowOutsideCwd);
     if (outside.all.length) log({ ev: 'cwd-advisory', alias, outside: outside.all, allowed: true });
+    // Resolved before anything touches the network. Two live aliases for one ticket is how a real round
+    // got lost, but the fix is a warning, not a veto: re-dispatching into the right cwd is legitimate -
+    // what was missing was saying so out loud.
+    const ledgerNow = readLedger();
+    if (supersedes && !ledgerNow[supersedes]) {
+      throw new Error(`supersedes "${supersedes}" is not in the ledger (owned: ${Object.keys(ledgerNow).join(', ') || 'none'})`);
+    }
+    const siblings = findSiblings(ledgerNow, { alias, cwd: dir, phase, task });
+    if (siblings.length) log({ ev: 'sibling-aliases', alias, found: siblings.map((x) => x.alias) });
     const sessionId = `dsh-${alias}`;
     const existing = readLedger()[alias];
     if (existing && normCwd(existing.cwd) !== normCwd(dir)) {
@@ -575,12 +586,15 @@ tool('dsh_launch', {
     const entry = await upsertAlias(alias, { sessionId, cwd: dir, phase: existing?.phase || phase || null,
       workspaceId: ws?.workspaceId || null, workspaceTitle: ws?.title || null, adopted: false,
       created: existing?.created || new Date().toISOString(), rounds: existing?.rounds || [] });
+    if (supersedes) await ledgerStore.transact((r) => applySupersedes(r, alias, supersedes), { label: 'supersedes', alias });
+    const siblingFields = siblings.length ? { siblingWarning: siblings,
+      note: `${siblings.length} other alias(es) look like the same work in another workspace: ${siblings.map((x) => `${x.alias} (${x.reasons.join(', ')})`).join('; ')}. Keep one of them authoritative - pass supersedes on the successor, or dsh_send the remaining rounds to the existing alias.` } : {};
     const pinned = await pinModel(sessionId, want);
     if (dryRun) {
       return json({ ok: true, alias, sessionId, cwd: dir, grouped: !!ws, workspaceId: ws?.workspaceId || null,
         workspaceTitle: ws?.title || null, pinned, dispatched: false,
         warnings: outside.write.length ? [`dispatched anyway because allowOutsideCwd:true - dsh's sandbox will deny writes to ${outside.write.join(' , ')}`] : [],
-        outsideCwd: outside, scope: await sessionScope(sessionId),
+        outsideCwd: outside, ...siblingFields, scope: await sessionScope(sessionId),
         note: 'dry run: session created and grouped, nothing dispatched' });
     }
     const scope = await sessionScope(sessionId);
@@ -588,7 +602,7 @@ tool('dsh_launch', {
     const rec = await recordRound(alias, { ...roundRecord(res, pinned), task });
     return json({ ok: true, alias, sessionId, cwd: dir, grouped: !!ws, workspaceTitle: ws?.title || null,
       round: rec.rounds ? rec.rounds.length : entry.rounds.length + 1, pinned, scope,
-      ...(rec.risk || {}),
+      ...(rec.risk || {}), ...siblingFields,
       warnings: outside.write.length ? [`allowOutsideCwd:true - writes to ${outside.write.join(' , ')} will be denied by the sandbox`] : [],
       outsideCwd: outside, ...res });
   } catch (e) { return fail(e); }
@@ -613,6 +627,8 @@ tool('dsh_send', {
     const rec = await recordRound(alias, { ...roundRecord(res, pinned), task });
     return json({ ok: true, alias, sessionId: s.sessionId, round: rec.rounds ? rec.rounds.length : (s.rounds || []).length + 1,
       pinned, scope, ...(rec.risk || {}),
+      ...(s.supersededBy ? { supersededBy: s.supersededBy,
+        note: `alias "${alias}" was superseded by "${s.supersededBy}" - this round went to the replaced session. Move to the successor unless that was deliberate.` } : {}),
       warnings: outside.write.length ? [`allowOutsideCwd:true - writes to ${outside.write.join(' , ')} will be denied by the sandbox (session workspace is ${s.cwd})`] : [],
       outsideCwd: outside, ...res });
   } catch (e) { return fail(e); }
@@ -748,7 +764,8 @@ tool('dsh_sessions', {
     await ensureServer();
     const owned = Object.entries(readLedger()).map(([alias, s]) => ({ alias, sessionId: s.sessionId, cwd: s.cwd,
       phase: s.phase || null, workspaceTitle: s.workspaceTitle || null, grouped: !!s.workspaceId,
-      pinned: s.pinned || null, rounds: (s.rounds || []).length, lastOutcome: lastRound(s).outcome || null }));
+      pinned: s.pinned || null, rounds: (s.rounds || []).length, lastOutcome: lastRound(s).outcome || null,
+      supersedes: s.supersedes || null, supersededBy: s.supersededBy || null }));
     if (!cwd) return json({ ok: true, owned, logging: audit.status() });
     const v = await call('session/list', ARGS.sessionList());
     return json({ ok: true, owned, logging: audit.status(),

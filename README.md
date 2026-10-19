@@ -208,13 +208,13 @@ dsh_status {alias}                 查看模型、token 用量和上下文压力
 | --- | --- | --- |
 | `dsh_models` | 无 | 返回实时模型目录与允许清单的交集，包含默认模型、可路由 provider、加载失败信息，以及**每个模型自己声明的 `efforts` / `defaultEffort`**（例如 `qoder/qfmodel` 只有 `low/medium/xhigh`，没有 `max`；不声明的如实报 `null`）。选 `reasoningEffort` 前读它，不要用 `selectModel` 试探——那是写操作 |
 | `dsh_permissions` | 可选 `alias` | **只读**查看沙箱面：dsh 提供的档位（`read-only` / `workspace-write` / `danger-full-access`）、实例默认档位；给了 `alias` 还会返回该会话的生效档位与变更史（`escalated`、`escalatedBy`、`approvals`）。**运行中的会话改不了沙箱档位**：dsh 随包方法表里没有 per-session 的档位写入口（`permissionPresets/set`、`session/setSandboxMode` 都不存在），只能在 dsh UI 里由人操作。`agentPresets/select` 存在但只对**首轮之前**的会话生效，`terminal/create` 的官方描述明示绕过 Agent 沙箱与审批——桥接刻意都不调用，理由见 [docs/REMOTE-SURFACE.md](docs/REMOTE-SURFACE.md) |
-| `dsh_launch` | `alias`, `cwd`, `task`; 可选 `phase`, `group`, `dryRun`, `allowOutsideCwd`, `model`, `reasoningEffort` | 新建命名会话、设置模型并提交第一轮；`dryRun` 只创建会话，不执行任务。任务被判定为**向工作区外写入**时在下发前拒绝，只读提及外部路径不拦 |
-| `dsh_send` | `alias`, `task`; 可选 `allowOutsideCwd`, `model`, `reasoningEffort` | 向同一会话提交下一轮（同一阶段返工用它，新阶段用新 `alias`） |
+| `dsh_launch` | `alias`, `cwd`, `task`; 可选 `phase`, `group`, `dryRun`, `allowOutsideCwd`, `supersedes`, `model`, `reasoningEffort` | 新建命名会话、设置模型并提交第一轮；`dryRun` 只创建会话，不执行任务。任务被判定为**向工作区外写入**时在下发前拒绝，只读提及外部路径不拦。若账本里另有别名像在做同一件事（同 phase，或工单正文大段相同而 cwd 不同），返回 `siblingWarning`；换会话重发时传 `supersedes:<旧别名>` 把替代关系写进账本 |
+| `dsh_send` | `alias`, `task`; 可选 `allowOutsideCwd`, `model`, `reasoningEffort` | 向同一会话提交下一轮（同一阶段返工用它，新阶段用新 `alias`）。若该别名已被 `supersedes` 取代，返回里会明说 `supersededBy` |
 | `dsh_adopt` | `alias`, `sessionId`, `cwd`; 可选 `phase` 等 | 接管已存在的 `dsh web` 会话，不改变其分栏 |
 | `dsh_wait` | `alias`; 可选 `maxSeconds`（≤ 45） | 在限定时间内等待本轮完成；返回本轮自己的判决（`state` / `verdictComplete`）。**本轮停在人身上时立即返回**（实测 50 ms）：审批看 `pending[]`，待人回答的提问看 `waitingOnHuman` / `asked[]`（含问题与选项） |
 | `dsh_status` | `alias` | 返回本轮状态、模型、token 用量、上下文压力、待答问题，以及会话边界信息：`workingDirectory`、`sandbox`（如 `workspace-write`）、`agentPreset`、`approvalPolicy` / `unattended`（能否无人值守）、`sessionStats` |
 | `dsh_result` | `alias`; 可选 `messages`（首页事件数，≤ 1000）、`round` | 获取某一轮（默认最新一轮）的验收载荷：**该轮全部**助手文本、工具调用、落盘文件、`toolErrors[]`（含失败正文与错误码）、`sandboxDenials`、`window` / `windowTruncated` / `verdictComplete` / `logExhausted`。`messages` 只影响首页大小，不影响完整性 |
-| `dsh_sessions` | 可选 `cwd` | 查看桥接持有的别名；传入 `cwd` 时额外查询该工作区的活会话 |
+| `dsh_sessions` | 可选 `cwd` | 查看桥接持有的别名（含 `supersedes` / `supersededBy` 替代关系），以及本进程的审计日志状态 `logging`；传入 `cwd` 时额外查询该工作区的活会话 |
 | `dsh_cancel` | `alias` | 请求取消当前轮；需再次检查最终状态 |
 
 **会话标识约定**：
