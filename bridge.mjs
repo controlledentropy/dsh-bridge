@@ -22,6 +22,7 @@
 //             asynchronously after boot, so an early dispatch can fail UNKNOWN_MODEL. A repeated
 //             requestId is deduped server-side, so a re-dispatch needs a new one. session/delete is
 //             not forwarded: the API can archive a session but never remove it.
+import { createHash } from 'node:crypto';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
@@ -32,10 +33,11 @@ import { HOST as LAUNCH_HOST, PORT as LAUNCH_PORT, STATE_DIR as LAUNCH_STATE, OU
 import { ARGS, envelope, authCookie, pastCursor, parseAllowlist, allowedText, checkPolicy, splitModel,
   checkAlias, checkCwd, normCwd, roundRecord, baselineFrom, interpret, modelLabel,
   unwrapProjections, pathsOutsideCwd, pageWindow as calcWindow, permissionHistory, walkRound,
-  approvalState, verdictFields, humanWaits, modelEfforts, PAGE_SIZE, MAX_PAGES } from './lib/api-contract.mjs';
+  approvalState, verdictFields, humanWaits, modelEfforts, pickVerdict, capTexts, inFlightRound,
+  PAGE_SIZE, MAX_PAGES } from './lib/api-contract.mjs';
 import { createLedgerStore, pushRound, LedgerUnconfirmed } from './lib/ledger-store.mjs';
 import { createAuditLog } from './lib/audit-log.mjs';
-import { findSiblings, applySupersedes } from './lib/alias-hygiene.mjs';
+import { findSiblings, applySupersedes, commonPrefixLength } from './lib/alias-hygiene.mjs';
 
 const num = (name, value, fallback) => {
   const n = Number(value);
@@ -378,6 +380,19 @@ function assertInsideCwd(task, dir, allowOutsideCwd) {
   throw e;
 }
 
+// A client-side timeout is not a cancellation. Measured on a live round: the MCP request timed out at
+// 6 s, dsh completed the round at ~14 s, and no session/cancel was ever sent. So the dangerous reaction
+// to a timeout is re-dispatching the same brief and paying twice for it. If a round is still in flight
+// for this alias and the new task is the same text, refuse and point at dsh_wait.
+function assertNotInFlight(alias, s, task, force) {
+  if (force) return;
+  const live = inFlightRound(s);
+  if (!live || commonPrefixLength(live.task, task) < 60) return;
+  const e = new Error(`alias "${alias}" has a round still in flight (requestId ${live.requestId}, baseline seq ${live.sinceSeq}, dispatched ${live.dispatchedAt}) and this is the same brief. A client timeout does not stop dsh - read it with dsh_wait / dsh_result instead of dispatching it again. Pass force:true only if running it twice is the point.`);
+  e.detail = { inFlight: { requestId: live.requestId, sinceSeq: live.sinceSeq, dispatchedAt: live.dispatchedAt } };
+  throw e;
+}
+
 // Resolved purely, before anything touches the network: a disallowed model must be refused without
 // cold-booting dsh and without creating a session, so a policy mistake has no side effects at all.
 function assertModelAllowed(model, effort) {
@@ -549,13 +564,15 @@ tool('dsh_launch', {
     cwd: z.string().describe('absolute workspace path; on Windows use backslashes'),
     task: z.string().describe('the task list; include acceptance criteria'),
     phase: z.string().optional(),
-    group: z.boolean().optional().describe('default true: put the session in the sidebar group for this path; false leaves it Ungrouped'),
-    dryRun: z.boolean().optional().describe('create + group + pin, dispatch nothing (spends no quota)'),
-    allowOutsideCwd: z.boolean().optional().describe('needed only when the task WRITES outside cwd; such a dispatch is refused without it because dsh will deny the writes and nobody can approve the escalation. Merely naming a path (the ticket, a skill file, another repo read) is not blocked - it is reported in outsideCwd.read'),
-    supersedes: z.string().optional().describe('the alias this new one takes over (e.g. re-dispatching the same ticket into the correct cwd). Records the handover on both sides, so a later round cannot be sent into the replaced session by mistake.'),
+    group: z.boolean().optional().describe('default true: land in the sidebar group for this path; false = Ungrouped'),
+    dryRun: z.boolean().optional().describe('create + group + pin, dispatch nothing. The session is then permanent - dsh forwards no session/delete'),
+    allowOutsideCwd: z.boolean().optional().describe('the task WRITES outside cwd (read-only mentions are reported, not blocked)'),
+    supersedes: z.string().optional().describe('alias this one takes over; records the handover on both sides'),
+    force: z.boolean().optional().describe('relaunch though an identical brief is still running here (a timeout does not cancel dsh)'),
+    detail: z.boolean().optional().describe('also return workspace group and full session scope'),
     ...modelParams,
   },
-}, async ({ alias, cwd, task, phase, model, reasoningEffort, group, dryRun, allowOutsideCwd, supersedes }) => {
+}, async ({ alias, cwd, task, phase, model, reasoningEffort, group, dryRun, allowOutsideCwd, supersedes, force, detail }) => {
   try {
     log({ ev: 'tool', tool: 'dsh_launch', alias, cwd });
     checkAlias(alias);
@@ -577,6 +594,7 @@ tool('dsh_launch', {
     if (existing && normCwd(existing.cwd) !== normCwd(dir)) {
       return fail(new Error(`alias "${alias}" is bound to ${existing.cwd}, not ${dir}. Use dsh_send for that session, or pick another alias.`));
     }
+    if (existing) assertNotInFlight(alias, existing, task, force);
     await ensureServer();
     let ws = existing?.workspaceId ? { workspaceId: existing.workspaceId, title: existing.workspaceTitle || null } : null;
     if (!existing) {
@@ -595,38 +613,44 @@ tool('dsh_launch', {
         workspaceTitle: ws?.title || null, pinned, dispatched: false,
         warnings: outside.write.length ? [`dispatched anyway because allowOutsideCwd:true - dsh's sandbox will deny writes to ${outside.write.join(' , ')}`] : [],
         outsideCwd: outside, ...siblingFields, scope: await sessionScope(sessionId),
-        note: 'dry run: session created and grouped, nothing dispatched' });
+        note: 'dry run: session created and grouped, nothing dispatched. The session now exists permanently - dsh forwards no session/delete, so only the UI can archive or remove it.' });
     }
     const scope = await sessionScope(sessionId);
     const res = await dispatchRound(sessionId, task, `${alias}-r${entry.rounds.length + 1}-${Date.now().toString(36)}`);
     const rec = await recordRound(alias, { ...roundRecord(res, pinned), task });
-    return json({ ok: true, alias, sessionId, cwd: dir, grouped: !!ws, workspaceTitle: ws?.title || null,
-      round: rec.rounds ? rec.rounds.length : entry.rounds.length + 1, pinned, scope,
+    return json({ ok: true, alias, sessionId, cwd: dir, grouped: !!ws,
+      round: rec.rounds ? rec.rounds.length : entry.rounds.length + 1, pinned,
+      sandbox: scope.sandbox, unattended: scope.unattended,
+      requestId: res.requestId, sinceSeq: res.sinceSeq, correlated: res.correlated, ...pickVerdict(res),
       ...(rec.risk || {}), ...siblingFields,
       warnings: outside.write.length ? [`allowOutsideCwd:true - writes to ${outside.write.join(' , ')} will be denied by the sandbox`] : [],
-      outsideCwd: outside, ...res });
+      outsideCwd: outside, ...(detail ? { workspaceTitle: ws?.title || null, scope } : {}) });
   } catch (e) { return fail(e); }
 });
 
 tool('dsh_send', {
-  description: 'Dispatch the next task list into an existing alias (a new round of the same conversation). Re-pins only if you pass model/reasoningEffort.',
+  description: 'Dispatch the next task list into an existing alias (a new round of the same conversation). Returns the handle and the verdict only - the round text comes from dsh_result. Refused if the same brief is still in flight (a timeout is not a cancellation) unless force:true.',
   inputSchema: { alias: z.string(), task: z.string(),
-    allowOutsideCwd: z.boolean().optional().describe('needed only when the task WRITES outside the session workspace; read-only mentions of outside paths are reported, not blocked'),
+    allowOutsideCwd: z.boolean().optional().describe('the task WRITES outside the session workspace (read-only mentions are reported, not blocked)'),
+    force: z.boolean().optional().describe('dispatch though an identical brief is still running here'),
     ...modelParams },
-}, async ({ alias, task, model, reasoningEffort, allowOutsideCwd }) => {
+}, async ({ alias, task, model, reasoningEffort, allowOutsideCwd, force }) => {
   try {
     log({ ev: 'tool', tool: 'dsh_send', alias });
     const s = regGet(alias);
     const want = assertModelAllowed(model, reasoningEffort);
     const outside = assertInsideCwd(task, s.cwd, allowOutsideCwd);
     if (outside.all.length) log({ ev: 'cwd-advisory', alias, outside: outside.all, allowed: true });
+    assertNotInFlight(alias, s, task, force);
     await ensureServer();
     const pinned = await pinModel(s.sessionId, want) || lastRound(s).pinned || s.pinned || null;
     const scope = await sessionScope(s.sessionId);
     const res = await dispatchRound(s.sessionId, task, `${alias}-r${(s.rounds || []).length + 1}-${Date.now().toString(36)}`);
     const rec = await recordRound(alias, { ...roundRecord(res, pinned), task });
     return json({ ok: true, alias, sessionId: s.sessionId, round: rec.rounds ? rec.rounds.length : (s.rounds || []).length + 1,
-      pinned, scope, ...(rec.risk || {}),
+      pinned, sandbox: scope.sandbox, unattended: scope.unattended,
+      requestId: res.requestId, sinceSeq: res.sinceSeq, correlated: res.correlated, ...pickVerdict(res),
+      ...(rec.risk || {}),
       ...(s.supersededBy ? { supersededBy: s.supersededBy,
         note: `alias "${alias}" was superseded by "${s.supersededBy}" - this round went to the replaced session. Move to the successor unless that was deliberate.` } : {}),
       warnings: outside.write.length ? [`allowOutsideCwd:true - writes to ${outside.write.join(' , ')} will be denied by the sandbox (session workspace is ${s.cwd})`] : [],
@@ -665,15 +689,16 @@ tool('dsh_adopt', {
     return json({ ok: true, alias, requestedSessionId: sessionId, sessionId: effectiveId,
       agentPreset: v?.agentPreset || null, reused: effectiveId === sessionId, cwd: dir, pinned,
       sidebarGroup: 'not settable after creation; the adopted session keeps whatever group dsh put it in',
-      tail: interpret(events, (await liveRow(effectiveId))?.running ?? null), rounds: entry.rounds.length,
+      tail: pickVerdict(interpret(events, (await liveRow(effectiveId))?.running ?? null)), rounds: entry.rounds.length,
       note: 'adopted without dispatching anything; call dsh_send to add a round' });
   } catch (e) { return fail(e); }
 });
 
 tool('dsh_wait', {
-  description: 'Watch the current round until it settles, parks on a human approval, or maxSeconds elapses. Keep maxSeconds <= 45 to stay under the MCP tool timeout; call again if it returns state "running".',
-  inputSchema: { alias: z.string(), maxSeconds: z.number().int().min(1).max(45).default(40) },
-}, async ({ alias, maxSeconds }) => {
+  description: 'Block until this round settles, parks on a human (approval or unanswered question), or maxSeconds elapses. Returns only the verdict (~200 B), never the round text. Keep maxSeconds <= 45; call again on "running". A client timeout does NOT cancel dsh - re-read, never re-dispatch.',
+  inputSchema: { alias: z.string(), maxSeconds: z.number().int().min(1).max(45).default(40),
+    detail: z.boolean().optional().describe('also return window, token usage, tool tail, last assistant text') },
+}, async ({ alias, maxSeconds, detail }) => {
   try {
     log({ ev: 'tool', tool: 'dsh_wait', alias });
     const s = regGet(alias);                             // a wrong alias is refused without waking dsh
@@ -692,15 +717,18 @@ tool('dsh_wait', {
       r = await readRound(s);
     }
     const bookkeeping = r.settled ? await refreshOutcome(alias, lastRound(s).requestId, r.state) : null;
-    return json({ ok: true, alias, round: (s.rounds || []).length, requestId: lastRound(s).requestId || null,
-      waitedMs: Date.now() - started, ...(bookkeeping || {}), ...r });
+    const slim = { ok: true, alias, round: (s.rounds || []).length, requestId: lastRound(s).requestId || null,
+      waitedMs: Date.now() - started, ...(bookkeeping || {}), ...pickVerdict(r) };
+    return json(detail ? { ...slim, approvalPolicy: r.approvalPolicy ?? null, lastAssistantText: r.lastAssistantText,
+      toolCalls: r.toolCalls, toolErrorCount: r.toolErrorCount, toolErrors: r.toolErrors,
+      touchedFiles: r.touchedFiles, window: r.window, tokenUsage: r.tokenUsage } : slim);
   } catch (e) { return fail(e); }
 });
 
 tool('dsh_status', {
-  description: 'Immediate snapshot: current round state, model actually used, token usage, context pressure, pending plan, open user questions, and whether the session can run unattended at all (approvalPolicy/unattended - policy "ask" parks a round on a human).',
-  inputSchema: { alias: z.string() },
-}, async ({ alias }) => {
+  description: 'Immediate heartbeat of one alias: the verdict, whether a human is holding it, and whether the session can run unattended. ~200 B by default; detail:true adds model, token usage, context pressure, plan, open questions, tool tail.',
+  inputSchema: { alias: z.string(), detail: z.boolean().optional() },
+}, async ({ alias, detail }) => {
   try {
     log({ ev: 'tool', tool: 'dsh_status', alias });
     const s = regGet(alias);                             // a wrong alias is refused without waking dsh
@@ -710,29 +738,37 @@ tool('dsh_status', {
     // cursor snapshot. (Measured before: dsh_status paid 10-13 /api calls, most re-reading the same
     // session/projections answer.)
     const hints = { p, asOfSeq: p?.asOfSeq };
+    const r = await readRound(s, hints);
     // The policy in effect NOW, not the one this round's events happen to contain: a human may have
     // escalated after the round ended, and "can I dispatch unattended" is about the present.
     const scope = await sessionScope(s.sessionId, hints).catch(() => null);
-    return json({ ok: true, alias, round: (s.rounds || []).length, ...await readRound(s, hints),
-      approvalPolicy: scope?.approvalPolicy ?? null, unattended: scope?.unattended ?? null,
-      plan: p?.plan, userQuestions: p?.userQuestions, workingDirectory: p?.workingDirectory,
-      sandbox: p?.permissions?.currentValue || null, permissions: p?.permissions || null,
-      agentPreset: p?.agentPreset || null, sessionStats: p?.sessionStats || null,
-      turnOutline: (p?.turnOutline || []).slice(-4),
+    // A status read that sees the verdict must write it back too: a recovery loop that only ever calls
+    // dsh_status would otherwise leave the ledger saying "running" for a round that finished.
+    const bookkeeping = r.settled ? await refreshOutcome(alias, lastRound(s).requestId, r.state) : null;
+    const slim = { ok: true, alias, round: (s.rounds || []).length, requestId: lastRound(s).requestId || null,
+      unattended: scope?.unattended ?? null, ...bookkeeping, ...pickVerdict(r) };
+    return json(detail ? { ...slim, approvalPolicy: scope?.approvalPolicy ?? null,
+      model: r.model, workingDirectory: p?.workingDirectory, sandbox: p?.permissions?.currentValue || null,
+      agentPreset: p?.agentPreset || null, plan: p?.plan, userQuestions: p?.userQuestions,
+      tokenUsage: p?.tokenUsage, contextPressure: p?.contextPressure, sessionStats: p?.sessionStats || null,
+      lastAssistantText: r.lastAssistantText, toolCalls: r.toolCalls, toolErrors: r.toolErrors,
+      touchedFiles: r.touchedFiles, window: r.window, turnOutline: (p?.turnOutline || []).slice(-4),
       phase: s.phase || null, workspaceTitle: s.workspaceTitle || null,
-      rounds: (s.rounds || []).map((r) => ({ requestId: r.requestId, outcome: r.outcome, pinned: r.pinned })) });
+      rounds: (s.rounds || []).map((x) => ({ requestId: x.requestId, outcome: x.outcome, pinned: x.pinned })) } : slim);
   } catch (e) { return fail(e); }
 });
 
 tool('dsh_result', {
-  description: 'Audit payload for one round: every assistant text of that round, the tool calls that produced them, failed tool bodies, files touched, turn outline. Reads the round from its own baseline and walks the cursor forward until the round\'s own turn/end is collected, then cuts there - so a settled round is never reported as idle, and a later round is never mistaken for this one.',
+  description: 'The deliverable of one round. Reads the round from its own baseline and walks to its own turn/end, then cuts there. Default only:"final" returns the last assistant text plus verdict, errors and file hints under a byte budget; only:"full" returns every assistant text of the round. The task text is not echoed back (the caller wrote it) - taskRef identifies it.',
   inputSchema: { alias: z.string(),
     messages: z.number().int().min(1).max(1000).default(24)
-      .describe('how many EVENTS the first page reads; the walk keeps paging to this round\'s turn/end regardless, and the answer contains the whole round either way, so raising only this changes cost/latency, not completeness'),
-    round: z.number().int().min(1).optional().describe('audit an earlier round instead of the latest') },
-}, async ({ alias, messages, round }) => {
+      .describe('how many EVENTS the first page reads; the walk keeps paging to this round\'s turn/end regardless, so raising only this changes cost/latency, not completeness'),
+    round: z.number().int().min(1).optional().describe('audit an earlier round instead of the latest'),
+    only: z.enum(['final', 'full']).default('final').describe('"final" = the closing message only; "full" = every assistant message of the round (oldest give way to the byte budget)'),
+    maxTextBytes: z.number().int().min(2000).max(200000).default(24000).describe('byte budget for assistant text; the last message is cut, never dropped') },
+}, async ({ alias, messages, round, only, maxTextBytes }) => {
   try {
-    log({ ev: 'tool', tool: 'dsh_result', alias, round: round || null });
+    log({ ev: 'tool', tool: 'dsh_result', alias, round: round || null, only });
     const s = regGet(alias);                             // a wrong alias is refused without waking dsh
     await ensureServer();
     const rounds = s.rounds || [];
@@ -743,32 +779,52 @@ tool('dsh_result', {
     const r = interpret(events, (await liveRow(s.sessionId))?.running ?? null);
     const bookkeeping = (r.settled && target.outcome !== r.state)
       ? await refreshOutcome(alias, target.requestId, r.state) : null;
-    return json({ ok: true, alias, round: round || rounds.length, requestId: target.requestId || null,
-      ...(bookkeeping || {}),
-      correlated: target.correlated ?? null, window, ...verdictFields(r, window),
-      model: modelLabel(p?.modelSelection?.lastUsed || target.pinned || s.pinned),
-      tokenUsage: p?.tokenUsage || null, ...r,
-      assistantTexts: events.filter((e) => e.type === 'assistant/message')
-        .map((a) => ({ turn: a.data?.turn, text: (a.data?.message?.content || []).filter((c) => c.type === 'text').map((c) => c.text).join('').slice(0, 1200) })),
-      turnOutline: (p?.turnOutline || []).slice(-6), task: target.task || null });
+    // assistant/message events are one per step and mostly carry no text at all (tool-only messages) -
+    // measured: 138 of them held ~4 KB of text inside 15 KB of JSON. Empty ones are not content.
+    const texts = events.filter((e) => e.type === 'assistant/message')
+      .map((a) => ({ turn: a.data?.turn, text: (a.data?.message?.content || []).filter((c) => c.type === 'text').map((c) => c.text).join('') }))
+      .filter((x) => x.text.trim().length > 0);
+    // The verdict fields are the point of this payload, so they are assembled the same way readRound
+    // does it - state, the qualifiers, and whether a human is holding the round (a result read that
+    // could not see `waitingOnHuman` would send an orchestrator back to polling a parked round).
+    const fields = { ...verdictFields(r, window), ...approvalState(events),
+      ...humanWaits(events, p?.userQuestions?.active || []) };
+    const verdict = { ok: true, alias, round: round || rounds.length, requestId: target.requestId || null,
+      correlated: target.correlated ?? null, model: modelLabel(p?.modelSelection?.lastUsed || target.pinned || s.pinned),
+      ...pickVerdict({ ...r, ...fields }), ...(bookkeeping || {}),
+      toolCallCount: r.toolCallCount, toolErrorCount: r.toolErrorCount, sandboxDenials: r.sandboxDenials,
+      assistantMessages: texts.length,
+      taskRef: target.task ? { bytes: Buffer.byteLength(target.task, 'utf8'),
+        sha256: createHash('sha256').update(target.task).digest('hex').slice(0, 16) } : null };
+    if (only === 'full') {
+      const cap = capTexts(texts, maxTextBytes);
+      return json({ ...verdict, assistantTexts: cap.kept, ...(cap.truncated ? { textsTruncated: cap.droppedCount, note: cap.note } : {}),
+        toolCalls: r.toolCalls, toolErrors: r.toolErrors, touchedFiles: r.touchedFiles,
+        turnOutline: (p?.turnOutline || []).slice(-6), window, tokenUsage: p?.tokenUsage || null });
+    }
+    const cap = capTexts(texts.slice(-1), maxTextBytes);
+    return json({ ...verdict, finalText: cap.kept[0]?.text ?? '', ...(cap.truncated ? { note: cap.note } : {}),
+      errors: r.toolErrors.map((x) => ({ code: x.code, name: x.name })), touchedFiles: r.touchedFiles,
+      hint: 'finalText is only the closing message; for the whole round pass only:"full". touchedFiles is a hint mined from tool output, not authority - verify against the files or git.' });
   } catch (e) { return fail(e); }
 });
 
 tool('dsh_sessions', {
   description: 'List aliases this bridge owns. Live dsh sessions are only returned when a cwd is given: the unfiltered list spans every workspace (90+ here) and must not be inlined.',
-  inputSchema: { cwd: z.string().optional() },
-}, async ({ cwd }) => {
+  inputSchema: { cwd: z.string().optional(), detail: z.boolean().optional().describe('also return pinned/workspace ids and the audit-log status') },
+}, async ({ cwd, detail }) => {
   try {
     log({ ev: 'tool', tool: 'dsh_sessions', cwd: cwd || null });
     const want = cwd ? normCwd(checkCwd(cwd)) : null;    // a bad path is refused without waking dsh
     await ensureServer();
     const owned = Object.entries(readLedger()).map(([alias, s]) => ({ alias, sessionId: s.sessionId, cwd: s.cwd,
-      phase: s.phase || null, workspaceTitle: s.workspaceTitle || null, grouped: !!s.workspaceId,
-      pinned: s.pinned || null, rounds: (s.rounds || []).length, lastOutcome: lastRound(s).outcome || null,
-      supersedes: s.supersedes || null, supersededBy: s.supersededBy || null }));
-    if (!cwd) return json({ ok: true, owned, logging: audit.status() });
+      phase: s.phase || null, rounds: (s.rounds || []).length, lastOutcome: lastRound(s).outcome || null,
+      supersedes: s.supersedes || null, supersededBy: s.supersededBy || null,
+      ...(detail ? { workspaceTitle: s.workspaceTitle || null, grouped: !!s.workspaceId, workspaceId: s.workspaceId || null,
+        pinned: s.pinned || null, adopted: !!s.adopted } : {}) }));
+    if (!cwd) return json({ ok: true, owned, ...(detail ? { logging: audit.status() } : {}) });
     const v = await call('session/list', ARGS.sessionList());
-    return json({ ok: true, owned, logging: audit.status(),
+    return json({ ok: true, owned, ...(detail ? { logging: audit.status() } : {}),
       liveInCwd: (v?.items || []).filter((i) => normCwd(i.cwd) === want)
         .map((i) => ({ sessionId: i.sessionId, running: !!i.running, blank: !!i.blank })),
       note: `total sessions across all workspaces: ${v?.items?.length ?? '?'}` });

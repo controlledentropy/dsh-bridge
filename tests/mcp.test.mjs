@@ -63,7 +63,7 @@ test('handshake, instructions and the full tool surface', async (t) => {
       }
       const launch = tools.find((x) => x.name === 'dsh_launch');
       assert.deepEqual(Object.keys(launch.inputSchema.properties).sort(),
-        ['alias', 'allowOutsideCwd', 'cwd', 'dryRun', 'group', 'model', 'phase', 'reasoningEffort', 'supersedes', 'task'].sort(),
+        ['alias', 'allowOutsideCwd', 'cwd', 'detail', 'dryRun', 'force', 'group', 'model', 'phase', 'reasoningEffort', 'supersedes', 'task'].sort(),
         'dsh_launch keeps every declared parameter');
       assert.ok((launch.inputSchema.required || []).includes('alias'));
       assert.match(client.getInstructions(), /trust "state"/, 'instructions state that acceptance is not completion');
@@ -155,6 +155,29 @@ test('nothing is written to the ledger by a refused call', async () => {
       const owned = parsed(await client.callTool({ name: 'dsh_sessions', arguments: {} }));
       assert.equal(owned.ok, false, 'dsh_sessions still needs dsh, so it fails rather than pretending to be empty');
       assert.match(String(owned.error), /DSH_NO_SPAWN/);
+    });
+    assertNoSideEffects(ws.state);
+  } finally { ws.cleanup(); }
+});
+
+test('a re-dispatch of a brief that is still running is refused, and nothing is touched', async () => {
+  // Measured behaviour this guards: the MCP request timed out at 6 s while dsh finished the round at
+  // ~14 s and never received a cancel. The dangerous client reaction is dispatching the same brief again
+  // and paying twice, so the bridge refuses until told otherwise.
+  const ws = workspace();
+  const brief = '目标：为 S2-02-F 固定 Unicode 16 派生产物。\n边界：只允许改动 third_party/unicode。\n验收：默认 verify 离线只读通过。\n交付：材料与回执。';
+  fs.mkdirSync(ws.state, { recursive: true });
+  fs.writeFileSync(path.join(ws.state, 'sessions.json'), JSON.stringify({
+    busy: { sessionId: 'dsh-busy', cwd: ws.cwd, rounds: [{ requestId: 'busy-r1', sinceSeq: 4, outcome: 'running',
+      dispatchedAt: new Date().toISOString(), task: brief }] } }));
+  try {
+    await withBridge(bridgeEnv(ws.state, {}), async (client) => {
+      const same = await client.callTool({ name: 'dsh_send', arguments: { alias: 'busy', task: brief } });
+      assert.equal(same.isError, true, 'the same brief must not be dispatched twice');
+      assert.match(String(parsed(same).error), /still in flight/);
+      assert.match(String(parsed(same).error), /busy-r1/, 'the answer must name the round to go read instead');
+      const other = await client.callTool({ name: 'dsh_send', arguments: { alias: 'busy', task: '换一个完全不同的任务：只读列出目录。' } });
+      assert.ok(!/still in flight/.test(String(parsed(other).error || '')), 'a different brief on the same alias is a normal next round');
     });
     assertNoSideEffects(ws.state);
   } finally { ws.cleanup(); }

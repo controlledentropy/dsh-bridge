@@ -175,6 +175,22 @@ dsh_status {alias}                 查看模型、token 用量和上下文压力
 
 如果会话已在 `dsh web` 界面存在，可以用 `dsh_adopt` 接管；如需停止正在运行的一轮，用 `dsh_cancel` 请求取消后再调用 `dsh_wait` 确认结果。
 
+### 回传什么、不回传什么
+
+桥是**拉取式**的：dsh 执行过程中不向调用方推任何东西，Codex/客户端只在调用工具时读回一份摘要。既然每个字节都要花调用方模型的上下文，默认形状被压到"裁决 + 交付物"：
+
+| 调用 | 默认返回 | 实测体积（真实 1084 事件轮） |
+| --- | --- | --- |
+| `dsh_wait` / `dsh_status` | 只回裁决块：`state / settled / verdictComplete / pending / waitingOnHuman / asked / error / note` + 心跳级标识 | 178 B（旧版 9974 B） |
+| `dsh_result` `only:"final"`（默认） | 最终一条助手文本 + 裁决 + 错误码 + `touchedFiles` + `taskRef` | ~3.5 KB（旧版 16567 B） |
+| `dsh_result` `only:"full"` | 本轮**非空**助手文本（旧消息按 `maxTextBytes` 让位，末条只截不丢）+ 工具明细 | 10982 B / 12 条（旧版 138 条里 126 条是空文本） |
+| `detail:true` | 上面所有字段的完整形态（window、tokenUsage、tool 尾、turnOutline…） | 按需 |
+
+固定开销一侧要诚实说明：工具定义 + `instructions` 每次会话都被注入，实测 **7776 B**。新增的 `supersedes` / `force` / `detail` 参数带来了约 1.1 KB 的固定成本，换来的是"同一工单两个在途会话"这类事故在派发前就被挡住；单次往返的成本则降了一个数量级。
+
+**超时语义（实测，勿凭直觉）**：客户端 `tool_timeout_sec` 越界只是**这一次 MCP 请求**被丢弃，dsh **继续执行到完成**（实测请求 6 s 超时、轮次 ~14 s 完成、日志里 `session/cancel` 零次）。因此超时后正确动作是**重新 `dsh_wait` 读**，不是重发——若同一别名仍有在跑的同文本轮次，`dsh_send` / `dsh_launch` 会直接拒绝，除非显式 `force:true`。
+
+
 ### 如何判断任务状态
 
 | `state` | 含义 | 建议动作 |

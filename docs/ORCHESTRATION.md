@@ -35,6 +35,7 @@
 
 ## 4. 判定规则
 
+- **默认回传只有裁决块**（~200 B）：`state / settled / verdictComplete / pending / waitingOnHuman / asked / error / note`。任务文本走 `dsh_result`（默认 `only:"final"`，只给最终一条 + 错误码 + 文件线索；要整轮再 `only:"full"`，并按 `maxTextBytes` 封顶）；诊断细节走 `detail:true`。派发与验收之间不要为了"看看进展"去拉全量。
 - `accepted:true` 只代表受理；`running` 由 true 变 false **不代表成功**。只有 `state:"completed"` 算完成。
 - `state:"idle"` 意味着本轮没有记录任何 turn（任务被吞或接管被拒），必须按"未验证"处理。
 - `state:"error"` 时读 `error.{code,message}` 原文上报，**不要**擅自降级到别的模型重跑。

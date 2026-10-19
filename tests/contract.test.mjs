@@ -12,7 +12,7 @@ import { fileURLToPath } from 'node:url';
 import { ARGS, envelope, authCookie, pastCursor, parseAllowlist, allowedText, checkPolicy, splitModel,
   modelLabel, ALIAS_RE, checkAlias, checkCwd, normCwd, roundRecord, baselineFrom, interpret, argText,
   unwrapProjections, pathsOutsideCwd, pageWindow, sliceRound, permissionHistory, approvalState,
-  walkRound, verdictFields, humanWaits, modelEfforts } from '../lib/api-contract.mjs';
+  walkRound, verdictFields, humanWaits, modelEfforts, pickVerdict, capTexts, inFlightRound } from '../lib/api-contract.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const PKG = path.resolve(HERE, '..');
@@ -437,4 +437,45 @@ test('modelEfforts reads the declared efforts instead of probing selectModel', (
   assert.deepEqual(modelEfforts({ id: 'y', reasoning: { efforts: ['low', 'max'] }, })
     .efforts, ['low', 'max'], 'a bare string list is accepted too');
   assert.equal(modelEfforts(null).efforts, null);
+});
+
+test('the default reply carries the verdict and nothing else', () => {
+  const full = { alias: 'a', state: 'completed', settled: true, running: false, verdictComplete: true,
+    windowTruncated: false, logExhausted: true, approvalPolicy: 'ask', pending: [], waitingOnHuman: false,
+    asked: [], note: undefined, lastAssistantText: 'x'.repeat(3000), toolCalls: [1, 2, 3], tokenUsage: { a: 1 },
+    sessionStats: { b: 2 }, window: { pages: 3 }, rounds: [{ requestId: 'r1' }], task: 'y'.repeat(2000) };
+  const slim = pickVerdict(full);
+  assert.deepEqual(Object.keys(slim).sort(), ['settled', 'state', 'verdictComplete'], 'falsy/empty bookkeeping is not a verdict; qualifiers appear only without one');
+  assert.ok(!('lastAssistantText' in slim) && !('task' in slim) && !('tokenUsage' in slim));
+  assert.ok(Buffer.byteLength(JSON.stringify(slim)) < 200, 'the branch-on payload stays tiny');
+  const parked = pickVerdict({ alias: 'a', state: 'running', settled: false, verdictComplete: false,
+    waitingOnHuman: true, asked: [{ name: 'ask_user_question', questions: [{ header: 'H', options: ['A', 'B'] }] }],
+    note: 'waiting on a human', lastAssistantText: 'noise' });
+  assert.deepEqual(Object.keys(parked).sort(), ['asked', 'note', 'settled', 'state', 'verdictComplete', 'waitingOnHuman'],
+    'settled:false and verdictComplete:false are the answer, not an absence of one');
+});
+
+test('capTexts keeps the tail and reports what it dropped', () => {
+  const items = [{ turn: 1, text: 'a'.repeat(100) }, { turn: 2, text: 'b'.repeat(100) }, { turn: 3, text: 'c'.repeat(100) }];
+  const all = capTexts(items, 1000);
+  assert.equal(all.truncated, false);
+  assert.deepEqual(all.kept.map((x) => x.turn), [1, 2, 3]);
+  const cut = capTexts(items, 210);
+  assert.deepEqual(cut.kept.map((x) => x.turn), [2, 3], 'the final answer is worth more than the oldest step narration');
+  assert.equal(cut.droppedCount, 1);
+  assert.equal(cut.truncated, true);
+  assert.match(cut.note, /1 earlier assistant message\(s\) omitted/);
+  assert.deepEqual(capTexts([], 10), { kept: [], droppedCount: 0, truncated: false, note: undefined });
+  const one = capTexts([{ turn: 9, text: 'x'.repeat(500) }], 100);
+  assert.equal(one.kept.length, 1, 'the final text is never dropped whole');
+  assert.equal(Buffer.byteLength(one.kept[0].text, 'utf8') <= 100, true);
+  assert.equal(one.kept[0].textTruncated, true);
+  assert.equal(one.truncated, true);
+});
+
+test('inFlightRound is the guard against paying twice for a timed-out call', () => {
+  const s = { rounds: [{ requestId: 'r1', outcome: 'completed' }, { requestId: 'r2', outcome: 'running' }] };
+  assert.equal(inFlightRound(s).requestId, 'r2');
+  assert.equal(inFlightRound({ rounds: [{ requestId: 'r1', outcome: 'aborted' }] }), null);
+  assert.equal(inFlightRound({}), null, 'no rounds at all is not in flight');
 });

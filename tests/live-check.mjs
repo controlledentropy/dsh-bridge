@@ -89,11 +89,17 @@ try {
 
   const aliases = Object.keys(ledger());
   if (aliases.length) {
+    // This is also the guard on the reply shape: the default payload must stay a verdict block, and the
+    // detail flag must be what brings the heavy diagnostics back. A silent regression to kilobytes per
+    // poll is exactly what the slim contract exists to prevent, so it is checked against a real round.
     for (const name of ['dsh_status', 'dsh_result']) {
       await step(`${name} on ${aliases[0]} (readback of a real round)`, async () => {
         const j = await call(client, name, { alias: aliases[0] });
         if (!['completed', 'error', 'idle', 'running'].includes(j.state)) throw new Error('state missing: ' + JSON.stringify(j).slice(0, 200));
-        return `state=${j.state} model=${j.model || '?'} toolCalls=${j.toolCallCount} correlated=${j.correlated ?? 'n/a'}`;
+        const bytes = JSON.stringify(j).length;
+        if (bytes > 4000) throw new Error(`default reply is ${bytes} B; the verdict block should stay small - pass detail:true for the rest`);
+        const d = await call(client, name, { alias: aliases[0], detail: true, only: 'full', maxTextBytes: 200000 });
+        return `state=${j.state} verdict=${j.verdictComplete} slim=${bytes}B detail=${JSON.stringify(d).length}B toolCalls=${d.toolCallCount} correlated=${j.correlated ?? 'n/a'}`;
       });
     }
   } else skip('readback', `no aliases in ${STATE}; launch one first`);
