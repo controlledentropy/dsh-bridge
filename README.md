@@ -6,7 +6,7 @@
 
 - 已实机验证：`@deepseek-ai/dsh@0.2.1-rc.2`、Windows 11、Node.js 24。要求 Node.js **≥ 18.14**（`headers.getSetCookie()`）。
 - CI：`.github/workflows/ci.yml`，Windows × Node 20/22，纯离线（不起 `dsh web`、不消耗模型额度）。
-- `/api` 不是稳定公开契约。升级 `dsh` 后先跑[兼容性检查](#升级与兼容性检查)。
+- `/api` 不是稳定公开契约。升级 `dsh` 后先跑[验证与自测](#验证与自测)里的升级顺序。
 
 ## 目录
 
