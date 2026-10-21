@@ -4,7 +4,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'node:path';
 import { childPath, resolveToolchain, toolchainProblems, parseNetstatListeners, parseLsofListeners,
-  npmGlobalBinDir, killTree } from '../launch.mjs';
+  npmGlobalBinDir, killTree, staleLockVerdict } from '../launch.mjs';
 
 const D = path.delimiter;
 
@@ -149,5 +149,18 @@ test('killTree on an already-dead pid touches nothing', async () => {
   assert.equal(res.alreadyGone, true);
   assert.equal(res.killed, true);
   assert.equal(called, false, 'no signal is sent to a pid that is gone');
+});
+
+// MEASURED 2026-10-21: a successful start left spawn.lock behind, so the next `start` inside the
+// two-minute window treated itself as a second spawner and waited out the whole boot timeout against
+// a lock whose holder had already returned. The lock guards the spawn decision, not the instance.
+test('a spawn lock left by a dead holder is taken, not waited on', () => {
+  assert.equal(staleLockVerdict({ ageMs: 1_000, holderPid: 424242, holderAlive: false }), 'take');
+  assert.equal(staleLockVerdict({ ageMs: 1_000, holderPid: 424242, holderAlive: true }), 'wait',
+    'a live holder is the only case worth waiting for');
+  assert.equal(staleLockVerdict({ ageMs: 200_000, holderPid: process.pid, holderAlive: true }), 'take',
+    'age alone still expires a wedged holder');
+  assert.equal(staleLockVerdict({ ageMs: 1_000, holderPid: NaN, holderAlive: false }), 'wait',
+    'an unreadable holder is not evidence of death');
 });
 

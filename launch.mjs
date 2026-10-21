@@ -354,6 +354,24 @@ export async function status() {
   return out;
 }
 
+// Two ways a lock stops meaning anything, and only the first one used to be handled: the holder may
+// be gone (killed, crashed, or a previous start that simply finished), or the file may be older than
+// the boot window. A live holder is the only case that justifies waiting - otherwise a start issued
+// right after a successful one waits the full boot timeout against a lock nobody is holding.
+export function staleLockVerdict({ ageMs, holderPid, holderAlive, staleMs = 120_000 }) {
+  if (ageMs > staleMs) return 'take';
+  if (Number.isInteger(holderPid) && holderPid > 0 && !holderAlive) return 'take';
+  return 'wait';
+}
+
+function pidAlive(pid) {
+  try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; }  // EPERM = exists, not ours
+}
+
+export function releaseSpawnLock() {
+  try { fs.rmSync(SPAWN_LOCK, { force: true }); } catch {}
+}
+
 function takeSpawnLock() {
   mkdirs();
   try { const fd = fs.openSync(SPAWN_LOCK, 'wx'); fs.writeSync(fd, String(process.pid)); fs.closeSync(fd); return true; }
@@ -361,7 +379,10 @@ function takeSpawnLock() {
     if (e.code !== 'EEXIST') return true;
     let age = Infinity; let holder = '';
     try { const st = fs.statSync(SPAWN_LOCK); age = Date.now() - st.mtimeMs; holder = readTextSmart(SPAWN_LOCK).trim(); } catch { return true; }
-    if (age > 120_000) { try { fs.rmSync(SPAWN_LOCK, { force: true }); } catch {} return takeSpawnLock(); }  // stale lock from a killed process
+    const holderPid = Number(holder);
+    if (staleLockVerdict({ ageMs: age, holderPid, holderAlive: pidAlive(holderPid) }) === 'take') {
+      releaseSpawnLock(); return takeSpawnLock();
+    }
     return { waiting: true, holder };
   }
 }
@@ -373,40 +394,47 @@ export async function start({ quiet = false } = {}) {
   }
   const lock = takeSpawnLock();
   if (lock === true) {
-    const c = await check();
-    const fatal = c.problems.filter((p) => !p.startsWith('composition note') && !p.includes('!= tested'));
-    if (fatal.length) return { ok: false, error: 'pre-flight failed: ' + fatal.join(' | ') };
-    mkdirs();
-    const fd = fs.openSync(OUT_FILE, 'w');
-    // The node that will actually run the instance is resolved absolutely (c.node), and its siblings -
-    // npm.cmd, npx.cmd, corepack.cmd - are exactly what the UI shells out to. MEASURED on this machine:
-    // neither the node install dir nor %APPDATA%\npm is on the agent shell's PATH, so an instance booted
-    // from here saw neither; git came from a MinGW dir that did happen to be on PATH.
-    const cp = childPath(process.env, [path.dirname(c.node), ...String(process.env.DSH_EXTRA_PATH || '').split(path.delimiter)]);
-    const toolchain = resolveToolchain(cp.path);
-    let pid = 0;
+    // The lock serialises the spawn decision, not the instance lifetime. It is released in every exit
+    // path: leaving it behind made the next `start` wait out the whole boot timeout on a lock held by
+    // a process that had already returned.
     try {
-      const child = spawn(c.node, [c.cli, '--profile', 'web', '--host', HOST, '--port', String(PORT), '--no-open'], {
-        cwd: RUN_DIR, detached: true, stdio: ['ignore', fd, fd], windowsHide: true,
-        env: { ...process.env, PATH: cp.path },
-      });
-      pid = child.pid; child.unref();
-    } finally { fs.closeSync(fd); }                       // the child keeps its own handle; don't leak ours
-    try { fs.chmodSync(OUT_FILE, 0o600); } catch {}        // captured file holds an owner-level bearer token
-    fs.writeFileSync(INSTANCE, JSON.stringify({ pid, port: PORT, version: c.version, startedAt: new Date().toISOString(),
-      pathAdded: cp.added, toolchain }, null, 2));
-    const bootProblems = toolchainProblems(toolchain);
-    const deadline = Date.now() + Number(process.env.DSH_BOOT_TIMEOUT_MS || 90000);
-    while (Date.now() < deadline) {
-      await new Promise((r) => setTimeout(r, 1500));
-      if (tokenFrom(OUT_FILE) && (await portOpen())) {
-        if (!quiet) console.log('dsh web up: pid ' + pid + ' version ' + c.version + '\nURL with token: ' + OUT_FILE
-          + (bootProblems.length ? '\nWARNING: ' + bootProblems.join('\nWARNING: ') : ''));
-        return { ok: true, pid, version: c.version, toolchain, pathAdded: cp.added,
-          problems: bootProblems, notes: c.problems.filter((p) => p.startsWith('composition note')) };
+      const c = await check();
+      const fatal = c.problems.filter((p) => !p.startsWith('composition note') && !p.includes('!= tested'));
+      if (fatal.length) return { ok: false, error: 'pre-flight failed: ' + fatal.join(' | ') };
+      mkdirs();
+      const fd = fs.openSync(OUT_FILE, 'w');
+      // The node that will actually run the instance is resolved absolutely (c.node), and its siblings -
+      // npm.cmd, npx.cmd, corepack.cmd - are exactly what the UI shells out to. MEASURED on this machine:
+      // neither the node install dir nor %APPDATA%\npm is on the agent shell's PATH, so an instance booted
+      // from here saw neither; git came from a MinGW dir that did happen to be on PATH.
+      const cp = childPath(process.env, [path.dirname(c.node), ...String(process.env.DSH_EXTRA_PATH || '').split(path.delimiter)]);
+      const toolchain = resolveToolchain(cp.path);
+      let pid = 0;
+      try {
+        const child = spawn(c.node, [c.cli, '--profile', 'web', '--host', HOST, '--port', String(PORT), '--no-open'], {
+          cwd: RUN_DIR, detached: true, stdio: ['ignore', fd, fd], windowsHide: true,
+          env: { ...process.env, PATH: cp.path },
+        });
+        pid = child.pid; child.unref();
+      } finally { fs.closeSync(fd); }                       // the child keeps its own handle; don't leak ours
+      try { fs.chmodSync(OUT_FILE, 0o600); } catch {}        // captured file holds an owner-level bearer token
+      fs.writeFileSync(INSTANCE, JSON.stringify({ pid, port: PORT, version: c.version, startedAt: new Date().toISOString(),
+        pathAdded: cp.added, toolchain }, null, 2));
+      const bootProblems = toolchainProblems(toolchain);
+      const deadline = Date.now() + Number(process.env.DSH_BOOT_TIMEOUT_MS || 90000);
+      while (Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 1500));
+        if (tokenFrom(OUT_FILE) && (await portOpen())) {
+          if (!quiet) console.log('dsh web up: pid ' + pid + ' version ' + c.version + '\nURL with token: ' + OUT_FILE
+            + (bootProblems.length ? '\nWARNING: ' + bootProblems.join('\nWARNING: ') : ''));
+          return { ok: true, pid, version: c.version, toolchain, pathAdded: cp.added,
+            problems: bootProblems, notes: c.problems.filter((p) => p.startsWith('composition note')) };
+        }
       }
+      return { ok: false, error: 'instance did not become ready within the boot timeout; see ' + OUT_FILE };
+    } finally {
+      releaseSpawnLock();
     }
-    return { ok: false, error: 'instance did not become ready within the boot timeout; see ' + OUT_FILE };
   }
   // Another process is spawning: wait for the shared capture file instead of racing it.
   const deadline = Date.now() + Number(process.env.DSH_BOOT_TIMEOUT_MS || 90000);
