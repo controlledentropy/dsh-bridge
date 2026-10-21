@@ -154,7 +154,7 @@ CREATE TABLE codex_turn (
 
 ## 5. 本契约明确不做的事
 
-- 不实现 Coordinator 调度逻辑（B3/B4）。
+- 不实现 Coordinator 调度逻辑（B3/B4）。原型只覆盖准入、意图、核对与消费四类判断，见 §7。
 - 不实现重试策略（`UNCERTAIN` 一律转人工，见 B3）。
 - 不定义跨机部署（单机 Mutex/管道范围）。
 - 不定义 DSH 侧写入协议（那是 `session/prompt` 的既有契约）。
@@ -174,3 +174,27 @@ CREATE TABLE codex_turn (
 
 第三、四处值得单独记下：**cursor 正确、gap 表错误的组合会让系统看起来"恢复了"，实际仍在报告缺口。** 两者必须由同一次写入更新，否则进度视图与账本会互相矛盾——现在的实现让这种不一致无法表达，而不是靠断言去追。
 
+
+---
+
+## 7. B3/B4 原型与实测边界（2026-10-21）
+
+原型在 `tools/probes/ledger/dispatch-store.mjs`，验收脚本 `b3-recovery.mjs`（24 项）、
+`b4-concurrency.mjs`（17 项）、`b-joint.mjs`（26 项）。它们实现的是**判断**，不是调度器：
+
+| 已实现 | 未实现（属于 P1 接线，不属于本契约） |
+|---|---|
+| 准入：goal 状态、预算、cwd、`clientRequestId` 幂等 | 真实 Codex / dsh 适配器 |
+| 意图：RPC 前落盘 `INTENT` | 单实例 claim 的抢占（B1 的管道，独立验证） |
+| 核对：`INTENT → SENT_UNKNOWN`，转人工，不自动重发 | 常驻 sidecar 与事件流的接线（B2 的事件层已独立验证） |
+| 消费：`delivered` 与 `acked` 分离 | 跨机部署 |
+| 事务：预算扣减与 dispatch 同事务 | 延迟/吞吐特性（只验证了正确性） |
+
+三条由实测确定、必须写进实现的语义：
+
+1. **预算扣减与 dispatch 插入同事务**——否则会出现"付了钱没有单"或"有单没付钱"，两者都会让
+   预算成为建议而不是约束。
+2. **`resume` 是执行动作**（E-CODEX-COLD-RESUME：它会消费排队项并起 turn），因此与派单共用同一套
+   门禁；原因上报顺序把 `uncertain-attempt-needs-human` 放在 `goal-not-authorized` 之前——前者是
+   因，后者是果，报果会让人去重新授权而不是去查那次发送。
+3. **失败不退款**：发送未确认的那一轮保持已花，因为"可能已执行"不能当作"没执行"来记账。

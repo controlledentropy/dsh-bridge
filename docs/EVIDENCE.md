@@ -741,3 +741,84 @@ lock whose recorded pid is dead is taken instead of waited on (`staleLockVerdict
 the reason the lock exists. And the instance still dies with the job that started it: the launcher
 detaches (`detached: true`, `unref`), but this host's tool sandbox reaps the whole job when the call
 returns, so a durable instance has to be started from a shell the user owns.
+
+---
+
+## E-DISPATCH-ADMISSION · B4: five writers, one round, and a writer killed mid-transaction
+
+Prototype: `tools/probes/ledger/dispatch-store.mjs`; acceptance: `b4-concurrency.mjs`. Every case is a
+separate OS process, because "two writers, one budget slot" tested inside one connection is not tested.
+
+| property | assertion |
+|---|---|
+| 5 processes race for `maxRounds = 1` | **exactly 1 admitted**, 4 refused with `budget-exhausted` |
+| the ledger after the race | `rounds_used = 1`, one dispatch row |
+| 6 processes race for `maxRounds = 3` | exactly 3 admitted, and `rounds_used == dispatches` |
+| the same `clientRequestId` sent twice | second is a `duplicate` carrying the **same** dispatch id, no second round |
+| a 7th request against a spent budget | refused at admission; nothing written |
+| a process that dies between `BEGIN` and `COMMIT` | `dsp-crashed` does not exist afterwards, `rounds_used` unchanged |
+
+The last row is the one that makes the first five trustworthy: the debit and the dispatch row are
+written in one `BEGIN IMMEDIATE` … `COMMIT`, so a killed writer cannot leave "a round paid for nothing".
+The kill happens after the `INSERT`, which is the strongest version of the test available without an
+OS-level snapshot.
+
+**What it does not prove.** Nothing about latency or throughput under real contention; `busy_timeout`
+is 5 s here, and a Coordinator that retries a `SQLITE_BUSY` differently could still lose a write. No
+test of two processes *in different sessions* (the single-instance claim is B1's pipe, and this
+prototype does not take that claim).
+
+---
+
+## E-DISPATCH-RECOVERY · B3: an intent survives the process, and a restart may not retry it
+
+Acceptance: `b3-recovery.mjs` (24 checks). The rule under test is that **"may have been sent" is a
+state the system can hold**, because every alternative collapses into either a duplicate execution or
+a silent loss.
+
+| property | assertion |
+|---|---|
+| `INTENT` written before the RPC, then the process dies | after reopen the attempt is still `INTENT` |
+| the round while the outcome is unknown | **stays spent** (`rounds_used = 1`) |
+| `reconcile()` | `INTENT → SENT_UNKNOWN`, goal → `needs_human`, and **no second attempt row** |
+| reconcile twice | idempotent; second call reports nothing uncertain |
+| the dispatch afterwards | still `admitted` — not settled, not rejected, not guessed |
+| resume gate | refuses on `stop-active`, `no-single-executor-claim`, `uncertain-attempt-needs-human`, `budget-exhausted`, `goal-not-authorized` |
+| delivery vs consumption | a delivered item is `unseen`; consumption cannot be acked before delivery |
+| illegal transitions | settle without `submitted` throws; a settled attempt cannot be overwritten |
+| a rejected send | rejects the dispatch, creates no delivery, **does not refund** the round |
+
+The gate's reason order is deliberate: `uncertain-attempt-needs-human` is reported before
+`goal-not-authorized`, because `needs_human` is what the uncertain attempt *made* the goal. Reporting
+the derived state first would send a human to re-authorise instead of to look at the send.
+
+**What it does not prove.** That a real Codex `queue/add` or dsh `session/prompt` behaves this way —
+the adapter here is a function that throws. It also does not prove the *reverse* direction: an attempt
+that was never sent but is classified `SENT_UNKNOWN` costs a human's attention, which is the intended
+trade, not an oversight.
+
+---
+
+## E-JOINT · B1–B4 in one run, with the failure inserted after the send
+
+`b-joint.mjs` (26 checks) drives a synthetic Coordinator end to end: admission with a budget, an
+intent, a mock adapter whose reply can be lost, a delivery, a consumption ack, a settlement, a
+process death, a reconcile, a human resolution, and the budget running out.
+
+The inserted failure is the one that matters: **the adapter receives the call and the caller never
+learns the outcome.** A clean error is easy — the ledger records `SENT_REJECTED` and moves on. A lost
+reply is what turns a retry into a duplicate execution, and the run confirms the Coordinator does not
+take that step: the goal stops at `needs_human`, resume is refused, and service only continues after
+`resolveUncertain(..., 'operator confirmed no turn started')`.
+
+Final invariants asserted after the whole run:
+
+- every `settled` dispatch has a delivery whose consumption is `acked` (settled ≠ delivered ≠ consumed);
+- no attempt is left `INTENT` or `SENT_UNKNOWN`;
+- `rounds_used == dispatches`, including the one that was rejected;
+- exactly one dispatch is `rejected`, and it is the uncertain one.
+
+**What this does not prove.** The mock adapter is a function, not a process: there is no stdio, no
+Codex child, no thread, and no real queue. B1's policy gate is exercised separately over a named pipe,
+and the two have not yet been joined in one process — that is P1 wiring, not a property of this
+prototype.
