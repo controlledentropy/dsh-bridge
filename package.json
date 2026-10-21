@@ -47,7 +47,9 @@
     "start": "node launch.mjs start",
     "check:live": "node tests/live-check.mjs",
     "prove:ledger": "node tools/probes/ledger/b2-acceptance.mjs && node tools/probes/ledger/b3-recovery.mjs && node tools/probes/ledger/b4-concurrency.mjs && node tools/probes/ledger/b-joint.mjs && node tools/probes/ledger/t1-ledger-defects.mjs",
-    "prove:ipc": "powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File tools/probes/ipc/run-b1.ps1"
+    "prove:ipc": "powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File tools/probes/ipc/run-b1.ps1",
+    "prove:t1": "node tools/probes/t1/acceptance.mjs",
+    "prove:t1:codex": "node tools/probes/t1/codex-stdio.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.32.1",

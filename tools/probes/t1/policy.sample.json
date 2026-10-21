@@ -1,0 +1,24 @@
+{
+  "handshakeToken": "t1-token",
+  "goals": [
+    {
+      "goalId": "goal-1",
+      "state": "authorized",
+      "maxRounds": 2,
+      "allowedWorkspaces": ["D:\\ws\\allowed"]
+    },
+    {
+      "goalId": "goal-proposed",
+      "state": "proposed",
+      "maxRounds": 5,
+      "allowedWorkspaces": ["D:\\ws\\allowed"]
+    },
+    {
+      "goalId": "goal-revoked",
+      "state": "revoked",
+      "maxRounds": 5,
+      "allowedWorkspaces": ["D:\\ws\\allowed"]
+    }
+  ],
+  "registeredThreads": ["thread-registered"]
+}

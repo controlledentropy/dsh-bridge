@@ -10,6 +10,13 @@
 //
 //   node tools/probes/mock-responses-server.mjs --port 0 --log <file> --text <reply>
 // Prints one JSON line {"port":N} on startup so the caller never has to guess the port.
+//
+// --call <substring> makes the FIRST model response a tool call instead of text, for any tool whose
+// name contains the substring; the second response is the reply text. This exists because "Codex
+// discovered the MCP tool" cannot be shown by a text reply - the model has to actually ask for the
+// tool, and the only way to make a mock model do that is to emit a function_call. The name is read
+// from the request's own tools array rather than hardcoded, so whatever naming scheme the client
+// applies is observed instead of assumed.
 import http from 'node:http';
 import fs from 'node:fs';
 
@@ -20,6 +27,8 @@ const REPLY = flag('--text', 'MOCK-ACK');
 const PORT = Number(flag('--port', '0'));
 const DELAY_MS = Number(flag('--delay', '0'));
 const FULL_LOG = flag('--full-log', '');
+const CALL_MATCH = flag('--call', '');
+const CALL_ARGS = flag('--call-args', '{}');
 
 const requests = [];
 const record = (o) => {
@@ -29,6 +38,24 @@ const record = (o) => {
 
 let seq = 0;
 const ev = (type, payload) => { seq++; return 'event: ' + type + '\ndata: ' + JSON.stringify({ type, sequence_number: seq, ...payload }) + '\n\n'; };
+
+let modelCalls = 0;          // one per POST to /responses, which is one model turn segment
+const callLog = [];          // what the mock decided, so a failed run explains itself
+
+function sseToolCall(res, responseId, { itemId, callId, name, args }) {
+  res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
+  const item = { id: itemId, type: 'function_call', call_id: callId, name, arguments: args, status: 'completed' };
+  res.write(ev('response.created', { response: { id: responseId, object: 'response', status: 'in_progress', output: [] } }));
+  res.write(ev('response.in_progress', { response: { id: responseId, status: 'in_progress' } }));
+  res.write(ev('response.output_item.added', { output_index: 0,
+    item: { id: itemId, type: 'function_call', call_id: callId, name, arguments: '', status: 'in_progress' } }));
+  res.write(ev('response.function_call_arguments.delta', { item_id: itemId, output_index: 0, delta: args }));
+  res.write(ev('response.function_call_arguments.done', { item_id: itemId, output_index: 0, arguments: args }));
+  res.write(ev('response.output_item.done', { output_index: 0, item }));
+  res.write(ev('response.completed', { response: { id: responseId, object: 'response', status: 'completed',
+    output: [item], usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 } } }));
+  res.end();
+}
 
 function sse(res, responseId, text) {
   res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
@@ -72,13 +99,42 @@ const server = http.createServer((req, res) => {
     if (FULL_LOG) { try { fs.appendFileSync(FULL_LOG, JSON.stringify({ at: entry.at, text: textOf, tools: parsed && parsed.tools }) + '\n'); } catch {} }
     if (!String(req.url || '').includes('/responses')) { res.writeHead(404); res.end('{}'); return; }
     const responseId = 'resp_mock_' + Date.now().toString(36) + '_' + Math.floor(Math.random() * 1e6).toString(36);
+
+    modelCalls += 1;
+    // Tool output travels back to the model as an input item of type function_call_output. Its
+    // presence is what "the call actually happened and was answered" looks like from here, so it is
+    // recorded rather than inferred from the call counter.
+    const sawToolOutput = Array.isArray(parsed && parsed.input)
+      && parsed.input.some((m) => m && (m.type === 'function_call_output' || m.type === 'tool_result'));
+
+    if (CALL_MATCH && modelCalls === 1) {
+      const match = toolNames.find((n) => n.includes(CALL_MATCH));
+      callLog.push({ at: entry.at, decision: match ? 'tool-call' : 'no-matching-tool', wanted: CALL_MATCH, match: match || null, toolNames });
+      if (match) {
+        sseToolCall(res, responseId, {
+          itemId: 'fc_mock_' + seq,
+          callId: 'call_mock_' + Date.now().toString(36),
+          name: match,
+          args: CALL_ARGS,
+        });
+        return;
+      }
+      // Falling through to text is deliberate: a run where the tool was never exposed must show the
+      // requested name and the offered names, not a timeout.
+    } else if (CALL_MATCH) {
+      callLog.push({ at: entry.at, decision: 'final-text', modelCalls, sawToolOutput });
+    }
     if (DELAY_MS > 0) setTimeout(() => sse(res, responseId, REPLY), DELAY_MS);
     else sse(res, responseId, REPLY);
   });
 });
 
 server.listen(PORT, '127.0.0.1', () => {
-  console.log(JSON.stringify({ port: server.address().port, reply: REPLY, delayMs: DELAY_MS }));
+  console.log(JSON.stringify({ port: server.address().port, reply: REPLY, delayMs: DELAY_MS, call: CALL_MATCH || null }));
 });
 
-process.on('SIGTERM', () => { try { server.close(); } catch {} process.exit(0); });
+// The caller drives this process, so the decision log has to be readable without guessing when to
+// stop it: SIGTERM is the normal exit and it prints the log on the way out.
+const dump = () => { if (CALL_MATCH) console.log(JSON.stringify({ callLog })); };
+process.on('SIGTERM', () => { try { dump(); } catch {} try { server.close(); } catch {} process.exit(0); });
+process.on('SIGINT', () => { try { dump(); } catch {} try { server.close(); } catch {} process.exit(0); });

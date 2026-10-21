@@ -822,3 +822,131 @@ Final invariants asserted after the whole run:
 Codex child, no thread, and no real queue. B1's policy gate is exercised separately over a named pipe,
 and the two have not yet been joined in one process — that is P1 wiring, not a property of this
 prototype.
+
+---
+
+## E-T1-LEDGER-DEFECTS · Two ledgers that mistook a matching key for a matching event
+
+`tools/probes/ledger/t1-ledger-defects.mjs` (38 checks). Both defects were found by inspecting
+`admitDispatch()` and `ingest()`, and both had one shape: the code checked a KEY and reported
+"idempotent", when the question was whether the CONTENT was the same.
+
+| defect | what it did | what it does now |
+|---|---|---|
+| a reused idempotency key | returned the old dispatch whenever `(goal_id, client_request_id)` matched, so a caller that reused its key for a different `cwd`/`taskId`/`topicId` was handed a dispatch it never made — and the call **succeeded** | `conflict` + `reason='idempotency-key-conflict'` + `differs[]`; no row, no round spent; `duplicate` is always `false` |
+| a forked event sequence | answered `duplicate` for any held `(topic, generation, seq)` without comparing `type`/`data`, dropping one of two payloads while the ledger claimed a clean prefix | identical content is a `duplicate` (key order normalised); differing content is `divergent` — held row keeps first write, the second version goes to `event_divergence`, `health='divergent'`, cursor does not move |
+
+The two fixes are deliberately asymmetric. A dispatch conflict is **refused** (the request has not
+happened yet, so nothing is serviceable). An event divergence is **recorded and escalated** (the
+events have already arrived, so both versions have to survive and neither may be chosen
+automatically).
+
+Three semantics follow, each with an assertion:
+
+1. `duplicate` and `divergent` are mutually exclusive, so a caller that checks only `duplicate`
+   cannot mistake a fork for a replay.
+2. `health` is recomputed from every known fact about the generation, not from the arriving frame —
+   otherwise the next clean event would wash a fork back to `live`. The cursor and the gap table were
+   already rebuilt in the same transaction; the divergence flag had to join them.
+3. Divergence outranks gap: a hole means some events are unknown, a fork means the events we hold are
+   not trustworthy, and the second cannot be repaired by waiting. `stats()` reports the count so the
+   flag is self-explaining.
+
+Comparison is on `type` + **key-order-normalised** `data`, and deliberately not on `at`: a replayed
+frame may be re-rendered with a new timestamp, and counting that as a fork would freeze topics that
+are merely being replayed.
+
+**Mutation-verified.** Re-injecting both defects fails 18 of the 38 checks, so the assertions are
+load-bearing rather than a restatement of the implementation. Counts unchanged elsewhere: b2 25,
+b3 24, b4 17, joint 26, unit tests 81.
+
+**What it does not prove.** That a real dsh source never renumbers under one `seq`, nor that a real
+client never reuses a `clientRequestId`. Both remain caller bugs; the point is that the ledger now
+says so instead of returning a plausible wrong answer.
+
+---
+
+## E-T1-ADAPTER-STDIO · A real MCP stdio Adapter over the real authenticated pipe
+
+`tools/probes/t1/acceptance.mjs` (30 checks). The client is an MCP client that **launches the Adapter
+as a child process** and speaks MCP over its stdin/stdout; the coordinator is B1's server, unmodified.
+Nothing is imported from the Adapter's own implementation, so a pass means the wire worked rather than
+that two modules agreed with each other.
+
+| T1 item | result |
+|---|---|
+| discovery of the tool surface | `['adapter_info','dispatch_submit']`, and nothing whose name suggests http/exec/sql/shell/admin/proxy |
+| Adapter → IPC → Coordinator | one `dispatch_submit` returns `dsp-<12 hex>` plus the budget the coordinator applied |
+| a legal request succeeds end to end | yes, with the correlation id echoed |
+| the refusals, replayed on this path | `unknown-goal`, `goal-not-authorized` (proposed **and** revoked), `thread-not-registered`, `cwd-not-allowed`, `bad-token`, `handshake-required`, DACL denial (connection refused at the kernel), `budget-exhausted` after exactly two admitted rounds |
+| no arbitrary forwarding surface | `adapter_info` reports filesystem/exec/http/sql/coordinatorAdmin all `false`; the outbound message is assembled field by field, so unknown argument keys cannot reach the wire |
+| input narrowing | `..` in a cwd, and a relative cwd, are refused before any IPC; unknown keys are dropped and a normal dispatch still occurs |
+
+Two design points are properties, not details:
+
+- **The connection is lazy.** A server that connects at startup cannot report a refusal *through a
+  tool result*, because it has already died. Here a DACL denial is a cached `connectError` returned by
+  every subsequent call: no retry storm, and the refusal stays attributable.
+- **A refusal is a fact about this process's credentials.** Retrying it per call would turn one policy
+  decision into an unbounded stream of new connections.
+
+**Finding, measured while the processes were alive:** the harness, the Adapter and the coordinator
+were attributed to a single SID. An MCP stdio child is **not** a separate security principal, so the
+process boundary is not a security boundary — every isolation claim has to come from the pipe DACL,
+the token and the policy.
+
+**What it does not prove.** That Codex discovers this Adapter (that is E-T1-CODEX-STATE-RUNTIME, and
+it is blocked), that the DACL holds against a caller in another logon session, or anything about the
+wire under load.
+
+---
+
+## E-T1-CODEX-STATE-RUNTIME · Blocked: the pinned Codex cannot initialise its state runtime
+
+T1 item 1 (Codex discovers and calls the MCP stdio tool) needs a real `codex app-server`. On
+2026-10-21 the pinned `codex-cli 0.160.0` starts and answers `--version`, but every `app-server`
+invocation exits 1 before listening:
+
+```
+Error: failed to initialize sqlite state runtime under <sqlite-home>: failed to initialize state runtime at <sqlite-home>
+```
+
+Measured, not assumed:
+
+| check | result |
+|---|---|
+| `codex --version` | `codex-cli 0.160.0` |
+| `app-server` with a fresh `.state/t1` home | exits 1, message above |
+| `app-server` with `.state/p0b1/codex-sqlite` (**worked on 2026-10-21 02:34**) | same failure |
+| `app-server` with `CODEX_HOME` under `C:\Users\MMGA\codex-t1probe` | same failure |
+| `app-server` with `CODEX_SQLITE_HOME` unset (falls back to `CODEX_HOME`) | same failure |
+| `codex mcp add` (writes `config.toml` only) | `failed to persist config … OS Error 5` |
+| the same commands with `LSBOX_*` / `SANDBOX_CENTER_*` stripped | same failure |
+| the same commands outside the tool sandbox | same failure |
+| a **new SQLite DB in the same directory, same user, different binary** (`node:sqlite`, WAL) | **succeeds** |
+| free space on `C:` and `D:` | 142 GB / 118 GB |
+
+The last two rows are what make this a fault in the binary's state runtime rather than a filesystem,
+permission or disk problem: another process creates a WAL database in the very directory Codex
+refuses, as the same user.
+
+`codex-stdio.mjs` treats this as **blocked, exit 3**, and prints what it does *not* establish:
+
+```json
+{"blocked": true, "phase": "app-server startup",
+ "reason": "app-server did not become ready",
+ "evidence": {"outcome": "exited", "exitCode": 1, "stderr": "… failed to initialize sqlite state runtime …"},
+ "whatThisDoesNotShow": "Nothing about T1 items 1, 3, 5 or 6 is established or refuted by this run."}
+```
+
+Exit 3 rather than 1 because "the environment prevented the test" and "the test failed" are different
+claims, and merging them invites weakening the assertions until they pass.
+
+**Consequence for T1.** Items 2, 4 and 7 are established (E-T1-ADAPTER-STDIO). Items 1, 3, 5 and 6 are
+**untested** against a real Codex. `codex-stdio.mjs` is written and runnable; it needs an environment
+where `app-server` can start. This is a second, distinct blocker from P0-b2: P0-b2 is the shell sandbox
+refusing `exec_command`, this is the state runtime refusing to initialise at all.
+
+**Why it cannot pass dishonestly.** The driver asserts that the `dispatchId` found in the tool result
+was minted by the coordinator — a value the model cannot fabricate — so it cannot succeed on a mock
+that never crossed the pipe.

@@ -20,7 +20,8 @@
 | B2 事件账本 | 已通过 25/25（临时 SQLite） |
 | B3 不确定状态 / B4 并发预算 | 已通过 24/24、17/17 |
 | B1–B4 联合验收 | 已通过 26/26（进程内合成） |
-| **T1 真实 MCP stdio Adapter 接线** | **未开始 ← 当前任务** |
+| T1.1 账本两处缺陷 | **已修**，38/38（含变异验证） |
+| **T1.2 stdio 接线** | **Phase A 通过 30/30**（真实 MCP stdio + 真实 IPC）；**Phase B 阻塞**（pinned Codex 无法初始化 state runtime） |
 | P0-b2 Windows Shell Sandbox provision | **阻塞**（缺可快照的独立 Windows 环境） |
 
 **第一条操作**
@@ -61,6 +62,8 @@ git switch feat/t1-mcp-adapter
 | B4 并发预算 | 同上 | `node …/b4-concurrency.mjs` | **17/17** |
 | 联合验收 | 同上 | `node …/b-joint.mjs` | **26/26** |
 | T1.1 账本缺陷 | `dispatch-store.mjs` / `events-store.mjs` | `node …/t1-ledger-defects.mjs` | **38/38**（含变异验证） |
+| T1.2 Adapter stdio | `tools/probes/t1/adapter.mjs` | `npm run prove:t1` | **30/30** |
+| T1.2 Codex 接线 | 同上 + pinned Codex | `npm run prove:t1:codex` | **blocked（exit 3）**，见 §3.2 |
 | 运行实例只读体检 | `tests/live-check.mjs` | `npm run check:live`（需 `DSH_ATTACH_OUTFILE`、`DSH_PORT`） | 5/5 |
 
 一键：`npm run prove:ledger`（五项串行）。证据与"未证明什么"见 `docs/EVIDENCE.md`：
@@ -98,17 +101,30 @@ git switch feat/t1-mcp-adapter
 必须：固定版本 Codex、独立 `CODEX_HOME`/`CODEX_SQLITE_HOME`、本地 Mock Responses Provider、
 合成 Goal/线程/目录/凭据、**零真实 DSH 写入**。
 
-| 验收项 | 落点 |
-|---|---|
-| 1 Codex 能发现并调用真实 MCP stdio 工具 | app-server 的 MCP 配置指向 Adapter，工具列表可见 |
-| 2 Adapter 经 IPC 请求 Mock Coordinator | 复用 `tools/probes/ipc/` 的管道 + 令牌模型 |
-| 3 合法只读请求成功 | 端到端一次成功调用，带 `dispatchId` |
-| 4 未认证 / 伪造 Goal / 伪造线程 / 越界目录 / 已撤销授权均拒绝 | B1 的 8 个拒绝理由在真实 stdio 路径上重放 |
-| 5 记录三方实际执行身份 | app-server、Adapter、Coordinator 各自的账户/SID/完整性级别 |
-| 6 不得因 Shell 沙箱未 provision 就断言 MCP 子进程起不来 | 沙箱只拦 `exec_command`；stdio 子进程须**实测**，见 `E-CODEX-SANDBOX-ROOT-CAUSE` |
-| 7 Agent 不得获得任意 HTTP 转发 / SQL / Coordinator 管理接口 | Adapter 的工具面只有白名单方法，参数经校验 |
+**已交付**：`tools/probes/t1/{adapter.mjs,ipc-client.mjs,codex-stdio.mjs,acceptance.mjs,policy.sample.json}`。
+Adapter 是真实 MCP stdio server（`McpServer` + `StdioClientTransport` 对侧），工具面仅
+`dispatch_submit` + 只读 `adapter_info`；连接惰性、失败缓存，消息按字段拼装（不做透传）。
+`mock-responses-server.mjs` 新增 `--call/--call-args`，可让 mock 模型发出 `function_call`
+（默认行为不变，已冒烟）。
 
-交付物：最小 Adapter、Mock Coordinator、可复现测试、进程身份证据、**未通过的权限边界**（如实写）。
+| 验收项 | 状态 | 落点 |
+|---|---|---|
+| 1 Codex 能发现并调用真实 MCP stdio 工具 | **未测（阻塞）** | `codex-stdio.mjs`，见 `E-T1-CODEX-STATE-RUNTIME` |
+| 2 Adapter 经 IPC 请求 Mock Coordinator | **通过** | `acceptance.mjs`，复用 B1 管道 + 令牌 |
+| 3 合法只读请求成功 | **通过（Adapter 侧）/ 未测（Codex 侧）** | 返回 `dsp-<12hex>` |
+| 4 未认证 / 伪造 Goal / 伪造线程 / 越界目录 / 已撤销授权均拒绝 | **通过（9 例）** | 含 DACL 拒绝与 `handshake-required` |
+| 5 记录三方实际执行身份 | **部分**：Adapter/Coordinator/驱动同一 SID（实测）；Codex 侧未测 | `acceptance.mjs` 身份段 |
+| 6 沙箱未 provision 不得断言 stdio 起不来 | **通过（Adapter 侧）**；Codex 侧未测 | `codex-stdio.mjs` 该断言待跑 |
+| 7 不得有 HTTP 转发 / SQL / 管理接口 | **通过** | `adapter_info.capabilities` 全 `false` + 别名黑名单 |
+
+**关键结论（已实测）**：MCP stdio 子进程与调用方**同一 SID**，进程边界不是安全边界。隔离只能来自
+管道 DACL、令牌与策略——这一条必须写进任何"隔离"表述里，不能靠"它是另一个进程"。
+
+**阻塞细节**：`codex app-server` 在本机任何 `CODEX_HOME` 下都 `failed to initialize sqlite state
+runtime`（含上一会话可用的 `.state/p0b1`、C 盘用户目录、剥离沙箱变量、沙箱外）。同一目录下
+`node:sqlite` 可正常建 WAL 库，故为二进制自身故障。`codex-stdio.mjs` 以 **exit 3 + blocked JSON**
+报告，而不是伪装成断言失败。**不要为了让它变绿而削弱断言**——该脚本靠"协调器铸造的 dispatchId
+出现在工具结果里"来防止这一点。
 
 ---
 
@@ -137,10 +153,11 @@ git switch feat/t1-mcp-adapter
 | 项 | 现状 |
 |---|---|
 | Shell 沙箱 | 系统级 provisioned，per-HOME 为 `notConfigured`，执行**fail-closed**；P0-b2 缺可快照环境 |
+| **pinned Codex state runtime** | **阻塞**：`app-server` 在任何 home 下均 `failed to initialize sqlite state runtime`；`--version` 正常。同目录 `node:sqlite` 可建库，故非权限/磁盘问题。见 `E-T1-CODEX-STATE-RUNTIME` |
 | E-INCIDENT-CRED-READ | 曾越界读取真实凭据（未打印），**轮换决策仍在项目所有者**，不得代做 |
 | 子进程被回收 | 本机工具沙箱在调用结束时回收整个作业对象，`detached` 也一并回收 → 长期实例须由用户自己的 shell 启动 |
 | P0-b4 | 部分完成的 turn 跨重启行为**未测** |
-| 新增待办（本次审计） | §3.1 的 (1)(2) 两处账本缺陷 |
+| 新增待办（本次 T1.1） | 已清零：两处账本缺陷已修并断言 |
 
 **未解决假设**：MCP stdio 子进程与 `exec_command` 不共享身份/网络策略——这正是 T1 验收项 5、6 要测的
 东西，**不要当成已知**。
