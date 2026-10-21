@@ -60,30 +60,35 @@ git switch feat/t1-mcp-adapter
 | B3 恢复语义 | `tools/probes/ledger/dispatch-store.mjs` | `node …/b3-recovery.mjs` | **24/24** |
 | B4 并发预算 | 同上 | `node …/b4-concurrency.mjs` | **17/17** |
 | 联合验收 | 同上 | `node …/b-joint.mjs` | **26/26** |
+| T1.1 账本缺陷 | `dispatch-store.mjs` / `events-store.mjs` | `node …/t1-ledger-defects.mjs` | **38/38**（含变异验证） |
 | 运行实例只读体检 | `tests/live-check.mjs` | `npm run check:live`（需 `DSH_ATTACH_OUTFILE`、`DSH_PORT`） | 5/5 |
 
-一键：`npm run prove:ledger`（四项串行）。证据与"未证明什么"见 `docs/EVIDENCE.md`：
+一键：`npm run prove:ledger`（五项串行）。证据与"未证明什么"见 `docs/EVIDENCE.md`：
 `E-IPC-POLICY`、`E-LEDGER`、`E-DISPATCH-RECOVERY`、`E-DISPATCH-ADMISSION`、`E-JOINT`、`E-LAUNCH-LOCK`。
 
 ---
 
 ## 3. T1 剩余工作
 
-### 3.1 T1.1 审计：已核实的三处缺陷（**未修，留给 T1 首步**）
+### 3.1 T1.1 审计：三处缺陷（(1)(2) **已修**，(3) 为复核点）
 
-1. **幂等键复用不比内容** — `dispatch-store.mjs` 的 `admitDispatch()` 按
-   `(goal_id, client_request_id)` 查旧行，命中即返回旧 dispatch。**同一 `clientRequestId` 携带不同
-   `cwd` / `taskId` / `topicId` 时被静默当成重放**，调用方拿到的是一份它没发过的请求。正确行为是判为
-   `conflict` 并拒绝，而不是返回旧单。
-2. **事件同序号不同载荷被当作 duplicate** — `events-store.mjs` 的 `ingest()` 只查
-   `(topic_id, source_generation, seq)` 是否存在，存在即返回 `duplicate`，**从不比对 `type`/`data`**。
-   同一 seq 的两个不同事件会有一个被无声吞掉；账本"幂等"与"分叉"必须可区分（建议 `health='divergent'`
-   + 转人工，不自动择一）。
+1. **幂等键复用不比内容 — 已修**（`admitDispatch()`，验收 `t1-ledger-defects.mjs` 前 14 项）。
+   命中 `(goal_id, client_request_id)` 后比对 `cwd`/`taskId`/`topicId`：一致才是 `duplicate`，
+   不一致返回 `conflict` + `differs[]`，**不落库、不扣预算**，且 `duplicate` 恒为 `false`。
+   冲突判定排在预算判定之前——`budget-exhausted` 读起来像"稍后重试"，而键冲突稍后依然在。
+2. **事件同序号不同载荷被当作 duplicate — 已修**（`ingest()`，验收同文件后 24 项）。
+   比对 `type` + 键序规范化后的 `data`：一致才 `duplicate`；不一致为 `divergent`——
+   保留先写行、第二版本存入 `event_divergence`、`health='divergent'`、**cursor 不动**。
+   `health` 改为粘性（每次按该代际全部已知事实重算），故随后的干净事件不会把分叉洗白；
+   分叉优先于缺口。`stats()` 增 `divergences` 计数使 `health` 可自解释。
 3. **启动锁**（已修，复核点）— `releaseSpawnLock()` 在 spawn 的 `finally` 中执行；`staleLockVerdict()`
    按记录 pid 是否存活判定接管；单测在 `tests/launch.test.mjs`。仍需人工确认的边界：持锁进程**存活但卡住**
    时仍会等满 90 s 启动超时（设计如此，不要"顺手"放宽）。
 
-其余审计项（预算扣减与插入同事务、`UNCERTAIN` 不自动重发）在 B3/B4 已有断言，T1 只需**复核断言是否
+两处修正的语义与理由见 `docs/EVENT-LEDGER-CONTRACT.md` §6-bis。两处修正**不对称**是刻意的：
+派单冲突**拒绝**（请求尚未发生），事件分叉**记录并升级**（事件已经抵达，两个版本都要活下来）。
+
+其余审计项（预算扣减与插入同事务、`UNCERTAIN` 不自动重发）在 B3/B4 已有断言；T1 只需**复核断言是否
 真的覆盖了实现的失败路径**，不要重开架构讨论。
 
 ### 3.2 T1.2 最小真实 MCP 调用链

@@ -174,17 +174,43 @@ CREATE TABLE codex_turn (
 
 第三、四处值得单独记下：**cursor 正确、gap 表错误的组合会让系统看起来"恢复了"，实际仍在报告缺口。** 两者必须由同一次写入更新，否则进度视图与账本会互相矛盾——现在的实现让这种不一致无法表达，而不是靠断言去追。
 
+### 6-bis. T1.1 审计发现的两处缺陷（已修，2026-10-21）
+
+前两处与上面的四处同源：**把"键相同"当成了"事件相同"**。键匹配是重放的必要条件，远不是充分条件。
+
+| 缺陷 | 现象 | 修正 |
+|---|---|---|
+| **幂等键复用不比内容** | `admitDispatch()` 命中 `(goal_id, client_request_id)` 即返回旧 dispatch。同一键携带不同 `cwd`/`taskId`/`topicId` 被静默当成重放，调用方拿到一份它没发过的请求，**而且调用是成功的**，上游无从察觉 | 命中旧行后比对请求身份三元组；不一致返回 `conflict` + `reason='idempotency-key-conflict'` + `differs[]`，`duplicate` 恒为 `false`，不落库、不扣预算 |
+| **事件同序号不同载荷被当作 duplicate** | `ingest()` 只查 `(topic, source_generation, seq)` 是否存在，存在即 `duplicate`，从不比对 `type`/`data`。同一 seq 的两个不同事件有一个被无声吞掉，账本对一条已分叉的序列宣称前缀干净 | 比对 `type` + 规范化 `data`（键序无关）；一致才是 `duplicate`，不一致是 `divergent`：保留先写行、把第二版本存入 `event_divergence`、`health='divergent'`、cursor 不动 |
+
+两处修正刻意**不对称**，因为事故形态不同：
+
+- 派单冲突是**拒绝**——请求尚未发生，可服务性为零，返回旧单比报错更糟。
+- 事件分叉是**记录并升级**——事件已经抵达，两个版本都必须活下来，谁也不许被自动选中。
+
+三条随之确定的语义：
+
+1. `duplicate` 与 `divergent` **互斥**。只检查 `duplicate` 的调用方不可能把分叉当无害重放。
+2. `health` 是**粘性**的：`divergent` 不会被随后一条干净事件覆盖回 `live`。每次写入都用"该代际已知的全部事实"重算，而不是用"这次这一帧"。
+3. **分叉优先于缺口**：有洞表示部分事件未知，分叉表示已持有的事件不可信，且后者不能靠等待修复。`stats()` 同时给出 `divergences` 计数，使 `health` 可自解释。
+
+比对 `type`+`data` 而**不**比 `at`：`at` 是源侧时间戳，重放时被重新渲染是合理的，把它计入分叉会让"仅仅在重放"的 topic 冻结。
+`data` 采用**键序规范化的 JSON** 比较，否则序列化器差异会伪造出分叉。
+
+验收：`tools/probes/ledger/t1-ledger-defects.mjs`（38 项）。断言经过**变异验证**：把两处缺陷重新注入后有 18 项失败，故这些断言是承重的，不是对既有实现的复述。
+
 
 ---
 
 ## 7. B3/B4 原型与实测边界（2026-10-21）
 
 原型在 `tools/probes/ledger/dispatch-store.mjs`，验收脚本 `b3-recovery.mjs`（24 项）、
-`b4-concurrency.mjs`（17 项）、`b-joint.mjs`（26 项）。它们实现的是**判断**，不是调度器：
+`b4-concurrency.mjs`（17 项）、`b-joint.mjs`（26 项）、`t1-ledger-defects.mjs`（38 项，见 §6-bis）。
+它们实现的是**判断**，不是调度器：
 
 | 已实现 | 未实现（属于 P1 接线，不属于本契约） |
 |---|---|
-| 准入：goal 状态、预算、cwd、`clientRequestId` 幂等 | 真实 Codex / dsh 适配器 |
+| 准入：goal 状态、预算、cwd、`clientRequestId` 幂等（含键复用冲突） | 真实 Codex / dsh 适配器 |
 | 意图：RPC 前落盘 `INTENT` | 单实例 claim 的抢占（B1 的管道，独立验证） |
 | 核对：`INTENT → SENT_UNKNOWN`，转人工，不自动重发 | 常驻 sidecar 与事件流的接线（B2 的事件层已独立验证） |
 | 消费：`delivered` 与 `acked` 分离 | 跨机部署 |

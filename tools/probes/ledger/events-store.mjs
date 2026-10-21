@@ -24,6 +24,15 @@
 // ledger reported "live" while 7..11 was still missing. Recomputing the interval set from (cursor,
 // held seqs) in the same transaction as the cursor makes "cursor is right, gaps are wrong"
 // unrepresentable rather than merely tested for.
+//
+// And a fifth: the key (topic, generation, seq) was treated as proof that two arrivals were the same
+// event. They are not. A source that renumbers, a proxy that rewrites a frame, or two producers on
+// one topic can all deliver DIFFERENT payloads under one seq, and the first version answered
+// "duplicate" to the second one - silently choosing a winner and calling the result idempotent.
+// Idempotent replay and a forked sequence look identical to a key check and must not: identical
+// content is a duplicate, differing content is a DIVERGENCE that freezes the topic's health and goes
+// to a human. Neither payload is discarded and neither is silently preferred - the held row keeps
+// first-write-wins, and the second version is preserved beside it as evidence.
 import { DatabaseSync } from 'node:sqlite';
 
 export const SCHEMA = `
@@ -64,7 +73,42 @@ CREATE TABLE IF NOT EXISTS gap (
   reason            TEXT,
   PRIMARY KEY (topic_id, source_generation, from_seq)
 );
+
+-- One seq, two different payloads. Append-only: the point is that BOTH versions survive, so the
+-- table cannot be a column on event (a column can only hold one of them). The primary key makes a
+-- repeated identical conflict collapse, while a third distinct payload gets its own row.
+CREATE TABLE IF NOT EXISTS event_divergence (
+  topic_id          TEXT NOT NULL,
+  source_generation INTEGER NOT NULL,
+  seq               INTEGER NOT NULL,
+  held_type         TEXT NOT NULL,            -- what the ledger kept (first write wins)
+  held_data         TEXT NOT NULL,
+  seen_type         TEXT NOT NULL,            -- what arrived second and was refused the row
+  seen_data         TEXT NOT NULL,
+  detected_at       TEXT NOT NULL,
+  PRIMARY KEY (topic_id, source_generation, seq, seen_type, seen_data)
+);
 `;
+
+// Canonical JSON, so that {a:1,b:2} and {b:2,a:1} are one payload rather than a divergence. Key
+// order is an artefact of whichever serializer produced the frame, not a property of the event.
+function stable(v) {
+  if (v === null || v === undefined) return 'null';
+  if (typeof v !== 'object') return JSON.stringify(v);
+  if (Array.isArray(v)) return '[' + v.map(stable).join(',') + ']';
+  const keys = Object.keys(v).sort();
+  return '{' + keys.map((k) => JSON.stringify(k) + ':' + stable(v[k])).join(',') + '}';
+}
+
+// Stored data is text; it still has to be canonicalised through the same function or a reordered
+// rewrite of an identical event would be reported as a fork.
+function canonicalStored(raw) {
+  try { return stable(JSON.parse(raw)); } catch { return String(raw); }
+}
+
+// type + data are the payload. `at` is deliberately excluded: it is a source-side timestamp that a
+// replay may reasonably re-render, and treating a re-rendered timestamp as a fork would freeze
+// topics that are merely being replayed.
 
 const now = () => new Date().toISOString();
 
@@ -114,13 +158,20 @@ function rebuildGaps(db, topicId, generation, cursor) {
 }
 
 /**
- * Ingest one event. Returns { added, duplicate, staged, cursor, gaps }.
+ * Ingest one event. Returns
+ *   { added, duplicate, divergent, staged, cursor, gaps, held?, conflict? }.
  *
  *   added      this seq was not held before (whether or not it is part of the prefix)
- *   duplicate  it was already held; ingestion is idempotent by (topic, generation, seq)
+ *   duplicate  IDENTICAL event already held; ingestion is idempotent by content, not merely by key
+ *   divergent  this seq is held with a DIFFERENT payload; the topic's health is frozen and a human
+ *              must decide. Neither version is dropped and neither is chosen automatically.
  *   staged     it is held but sits above the cursor, waiting for the hole below it
  *   cursor     the contiguous prefix after this call
  *   gaps       the missing ranges after this call, inclusive and disjoint
+ *   conflict   only when divergent: both payloads and the seq they collided on
+ *
+ * `duplicate` and `divergent` are mutually exclusive by construction: a caller that checks only
+ * `duplicate` cannot accidentally treat a fork as a harmless replay.
  */
 export function ingest(db, topicId, generation, ev) {
   const t = topicState(db, topicId, generation);
@@ -128,24 +179,73 @@ export function ingest(db, topicId, generation, ev) {
   const seq = ev.seq;
   if (!Number.isInteger(seq)) throw new Error('seq must be an integer');
 
-  return tx(db, () => {
-    if (seq <= t.cursor) return { added: false, duplicate: true, staged: false, cursor: t.cursor, gaps: gapRanges(db, topicId, generation) };
+  const seen = { type: String(ev.type || 'unknown'), data: stable(ev.data ?? null) };
 
-    const held = db.prepare('SELECT 1 AS hit FROM event WHERE topic_id = ? AND source_generation = ? AND seq = ?')
+  return tx(db, () => {
+    const held = db.prepare('SELECT type, data FROM event WHERE topic_id = ? AND source_generation = ? AND seq = ?')
       .get(topicId, generation, seq);
-    if (held) return { added: false, duplicate: true, staged: true, cursor: t.cursor, gaps: gapRanges(db, topicId, generation) };
+
+    if (held) {
+      const prior = { type: held.type, data: canonicalStored(held.data) };
+      if (prior.type !== seen.type || prior.data !== seen.data) {
+        return diverge(db, { topicId, generation, seq, prior, seen, cursor: t.cursor,
+          staged: seq > t.cursor });
+      }
+      return { added: false, duplicate: true, divergent: false, staged: seq > t.cursor,
+        cursor: t.cursor, gaps: gapRanges(db, topicId, generation) };
+    }
+
+    // seq at or below the cursor with no row held cannot happen while the cursor only advances over
+    // existing rows; if it does, the ledger is internally inconsistent and must not be guessed at.
+    if (seq <= t.cursor) {
+      throw new Error('ledger inconsistent: seq ' + seq + ' is inside the prefix (cursor ' + t.cursor + ') but not held');
+    }
 
     db.prepare(`INSERT INTO event (topic_id, source_generation, seq, type, at, data, received_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?)`)
-      .run(topicId, generation, seq, String(ev.type || 'unknown'), String(ev.at || now()), JSON.stringify(ev.data ?? null), now());
+      .run(topicId, generation, seq, seen.type, String(ev.at || now()), JSON.stringify(ev.data ?? null), now());
 
     const cursor = advanceCursor(db, topicId, generation, t.cursor);
     const gaps = rebuildGaps(db, topicId, generation, cursor);
     db.prepare('UPDATE topic SET cursor = ?, health = ?, last_frame_at = ? WHERE topic_id = ? AND source_generation = ?')
-      .run(cursor, gaps.length ? 'gap' : 'live', now(), topicId, generation);
+      .run(cursor, healthFor(db, topicId, generation, gaps.length), now(), topicId, generation);
 
-    return { added: true, duplicate: false, staged: seq > cursor, cursor, gaps };
+    return { added: true, duplicate: false, divergent: false, staged: seq > cursor, cursor, gaps };
   });
+}
+
+// Health is a function of everything known about the generation, not of this one arrival. Writing
+// 'live' on every clean insert is how a divergence would erase itself: the next frame after a fork
+// would report the topic healthy again while the fork is still unresolved.
+//
+// Divergence outranks gap when both are present: a hole means some events are unknown, a fork means
+// the events we do hold are not trustworthy - and the second cannot be repaired by waiting.
+function healthFor(db, topicId, generation, gapCount) {
+  const forked = db.prepare('SELECT 1 AS hit FROM event_divergence WHERE topic_id = ? AND source_generation = ? LIMIT 1')
+    .get(topicId, generation);
+  if (forked) return 'divergent';
+  return gapCount ? 'gap' : 'live';
+}
+
+// Keep the held row, keep the newcomer beside it, and refuse to pick a winner. The cursor does not
+// move: a forked seq is not confirmed data, and promoting it would hand consumers the version the
+// ledger happened to receive first.
+function diverge(db, { topicId, generation, seq, prior, seen, cursor, staged }) {
+  db.prepare(`INSERT OR IGNORE INTO event_divergence
+              (topic_id, source_generation, seq, held_type, held_data, seen_type, seen_data, detected_at)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
+    .run(topicId, generation, seq, prior.type, prior.data, seen.type, seen.data, now());
+  db.prepare('UPDATE topic SET health = ?, last_frame_at = ? WHERE topic_id = ? AND source_generation = ?')
+    .run('divergent', now(), topicId, generation);
+  return {
+    added: false,
+    duplicate: false,
+    divergent: true,
+    staged,
+    cursor,
+    gaps: gapRanges(db, topicId, generation),
+    conflict: { seq, held: prior, seen },
+  };
 }
 
 export function ingestMany(db, topicId, generation, events) {
@@ -173,6 +273,18 @@ export const gaps = (db, topicId, generation) =>
 export const gapRanges = (db, topicId, generation) =>
   gaps(db, topicId, generation).map((g) => [g.from_seq, g.to_seq]);
 
+// The evidence behind health='divergent'. A count alone would let a Coordinator report "one fork"
+// while being unable to say which seq or what the two payloads were, which is not an escalation a
+// human can act on.
+export const divergences = (db, topicId, generation) =>
+  db.prepare(`SELECT seq, held_type, held_data, seen_type, seen_data, detected_at
+              FROM event_divergence WHERE topic_id = ? AND source_generation = ? ORDER BY seq, detected_at`)
+    .all(topicId, generation);
+
+export const divergenceCount = (db, topicId, generation) =>
+  db.prepare('SELECT COUNT(*) AS n FROM event_divergence WHERE topic_id = ? AND source_generation = ?')
+    .get(topicId, generation).n;
+
 // Consumers read the prefix. Held events are readable only on request, because handing a downstream
 // stage a sequence with a hole under it is exactly how a "gap" becomes a silent reordering.
 export function eventsAfter(db, topicId, generation, afterSeq, { confirmedOnly = true } = {}) {
@@ -195,5 +307,8 @@ export const stats = (db, topicId, generation) => {
     maxSeq: row.maxSeq === null ? null : row.maxSeq,
     staged: heldAboveCursor(db, topicId, generation),
     gaps: gapRanges(db, topicId, generation),
+    // Present so that health='divergent' is explainable from the same snapshot rather than being a
+    // flag whose cause has to be looked up separately.
+    divergences: divergenceCount(db, topicId, generation),
   };
 };

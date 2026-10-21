@@ -114,11 +114,33 @@ export function authorizeGoal(db, goalId) {
 
 const DISPATCHABLE = new Set(['authorized', 'running']);
 
+// What a clientRequestId actually stands for. The key is an idempotency token for ONE request, not
+// a licence to reuse a name: "same key, different body" is a caller bug (a retried write whose
+// payload was edited, a key generated once and reused across tasks) and reporting it as a replay
+// hands the caller a dispatch it never asked for, for a cwd or task it never named.
+const requestIdentity = ({ cwd, taskId, topicId }) =>
+  ({ cwd: cwd ?? null, taskId: taskId ?? null, topicId: topicId ?? null });
+
+const identityDiff = (prior, wanted) => {
+  const had = requestIdentity({ cwd: prior.cwd, taskId: prior.task_id, topicId: prior.topic_id });
+  return ['cwd', 'taskId', 'topicId'].filter((f) => had[f] !== wanted[f]);
+};
+
 /**
- * Admit one dispatch. Returns { admitted, duplicate, dispatchId, roundsUsed, reason? }.
+ * Admit one dispatch. Returns
+ *   { admitted, duplicate, conflict, dispatchId?, roundsUsed, reason?, differs? }.
  *
  * All four checks and the debit happen inside one IMMEDIATE transaction: two callers racing for the
  * last round cannot both see "one left".
+ *
+ * The idempotency lookup is TWO checks, not one. A prior row under the same key is a replay only if
+ * it describes the same request; otherwise it is a conflict, and the answer is a refusal. Returning
+ * the old dispatch would be worse than an error, because it succeeds: the caller proceeds believing
+ * its cwd/task/topic were accepted.
+ *
+ * The conflict is reported before the budget check on purpose. "budget-exhausted" reads as "retry
+ * later"; the key collision will still be there later, and a caller told to wait never learns that
+ * its request body is the problem.
  */
 export function admitDispatch(db, { goalId, cwd, clientRequestId = null, taskId = null, topicId = null }) {
   return tx(db, () => {
@@ -129,7 +151,24 @@ export function admitDispatch(db, { goalId, cwd, clientRequestId = null, taskId 
     if (clientRequestId) {
       const prior = db.prepare('SELECT * FROM dispatch WHERE goal_id = ? AND client_request_id = ?').get(goalId, clientRequestId);
       // Idempotency is a read of the ledger, not a hope: the second call must not spend a second round.
-      if (prior) return { admitted: false, duplicate: true, dispatchId: prior.dispatch_id, roundsUsed: g.rounds_used };
+      if (prior) {
+        const differs = identityDiff(prior, requestIdentity({ cwd, taskId, topicId }));
+        if (differs.length) {
+          // Not written to the ledger: a refused admission is not a dispatch, and inventing a row to
+          // remember it would make it look like one. The caller logs the refusal; the audit trail is
+          // the JSONL log, not this table.
+          return {
+            admitted: false,
+            duplicate: false,
+            conflict: true,
+            reason: 'idempotency-key-conflict',
+            dispatchId: prior.dispatch_id,
+            differs,
+            roundsUsed: g.rounds_used,
+          };
+        }
+        return { admitted: false, duplicate: true, conflict: false, dispatchId: prior.dispatch_id, roundsUsed: g.rounds_used };
+      }
     }
 
     if (g.rounds_used >= g.max_rounds) return { admitted: false, reason: 'budget-exhausted', roundsUsed: g.rounds_used, max: g.max_rounds };
@@ -142,7 +181,7 @@ export function admitDispatch(db, { goalId, cwd, clientRequestId = null, taskId 
                 VALUES (?, ?, ?, ?, ?, ?, 'admitted', ?)`)
       .run(dispatchId, goalId, taskId, topicId, clientRequestId, cwd, now());
     db.prepare('UPDATE goal SET rounds_used = rounds_used + 1, state = ? WHERE goal_id = ?').run('running', goalId);
-    return { admitted: true, duplicate: false, dispatchId, roundsUsed: g.rounds_used + 1 };
+    return { admitted: true, duplicate: false, conflict: false, dispatchId, roundsUsed: g.rounds_used + 1 };
   });
 }
 
