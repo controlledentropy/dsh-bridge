@@ -4,6 +4,9 @@ node_modules/
 .state/
 .state-*/
 
+# The agent workspace: project memory and session state, per machine, never part of the source.
+.workbuddy/
+
 # dsh plugins drop their own caches into the directory they were started from - which, when the
 # bridge cold-boots dsh web, is this source tree (measured: .dsh-mattskillsdeck-cache/logs/*.log).
 .dsh-*/
