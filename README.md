@@ -195,7 +195,8 @@ node tests/live-check.mjs
 | `lib/audit-log.mjs` | 审计日志与滚动 |
 | `lib/alias-hygiene.mjs` | 别名相似度与 supersedes 关系 |
 | `lib/remote-surface.mjs` | 解析 dsh 随包方法表 |
-| `docs/` | 协议细节、编排规范、方法表（生成物） |
+| `docs/HANDOFF.md` | **当前状态与下一任务入口（滚动覆盖，新会话从这里开始）** |
+| `docs/` | 协议细节、编排规范、方法表（生成物）、证据日志 |
 
 ## 许可
 
