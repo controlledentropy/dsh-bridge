@@ -45,7 +45,9 @@
     "surface:check": "node tools/remote-surface.mjs --check",
     "doctor": "node launch.mjs doctor",
     "start": "node launch.mjs start",
-    "check:live": "node tests/live-check.mjs"
+    "check:live": "node tests/live-check.mjs",
+    "prove:ledger": "node tools/probes/ledger/b2-acceptance.mjs && node tools/probes/ledger/b3-recovery.mjs && node tools/probes/ledger/b4-concurrency.mjs && node tools/probes/ledger/b-joint.mjs",
+    "prove:ipc": "powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File tools/probes/ipc/run-b1.ps1"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.32.1",
