@@ -61,7 +61,7 @@ const client = await connect();
 try {
   await step('mcp handshake', async () => 'connected as an MCP child process');
   const { tools } = await client.listTools();
-  const expected = ['dsh_models', 'dsh_permissions', 'dsh_launch', 'dsh_send', 'dsh_adopt', 'dsh_wait', 'dsh_status', 'dsh_result', 'dsh_sessions', 'dsh_cancel'];
+  const expected = ['dsh_models', 'dsh_permissions', 'dsh_launch', 'dsh_send', 'dsh_adopt', 'dsh_wait', 'dsh_status', 'dsh_result', 'dsh_sessions', 'dsh_cancel', 'dsh_stop'];
   await step('tools/list', () => {
     const got = tools.map((t) => t.name).sort();
     if (JSON.stringify(got) !== JSON.stringify([...expected].sort())) throw new Error(`tool surface changed: ${got.join(', ')}`);
