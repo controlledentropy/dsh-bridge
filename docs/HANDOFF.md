@@ -215,3 +215,27 @@ B2 改为"乱序入库、只把连续前缀计入 cursor、gap 由 `(cursor, 已
 3. 先做 §3.1（两处账本缺陷 + 断言），再做 §3.2；每步给可复核命令，失败退非零。
 
 **上下文预算**：本会话在 ~79% 时交接。新会话若再次接近 150k，优先完成当前切片并提交，再交接。
+
+---
+
+## 9. 后续会话范围（摘自项目 lead 委派书；T1 完成时由新交接细化）
+
+- **T2 · DSH WebSocket 事件接入**：`session/follow → 规范化 → SQLite 账本`。必须验证
+  `sinceSeq`、快照游标、`sourceGeneration`（源代际）与传输重连代际的**区别**；重复/乱序/缺口/重连/
+  窗口截断；原始 WS 事件与磁盘日志、HTTP page 的格式差异（**不得假设内部日志类型都会从 WS 推送**）。
+  终态判定要分四层：`raw event → dispatch correlation → business settlement → delivery candidate`，
+  不得把任意 `turn/end` 当成"可以唤醒 Codex"。`lib/api-contract.mjs` 的 `interpret()` 若依赖 HTTP page
+  快照，须建显式适配或重建，不得直接套用。
+- **T3 · 最小 Coordinator**：`Dispatch → 事件 → 账本 → Delivery → Codex Queue`，沿用
+  `Goal / Task / Dispatch / Attempt / Event / Delivery / Codex Turn`。三条硬约束：单执行者（不靠
+  heartbeat 超时接管）、结果未知即暂停、预算在 `queue/add`/`thread/resume`/`launch/send` 三个入口生效。
+  冷线程恢复须先核对 Goal、队列、预算、stop、`UNCERTAIN`，**禁止开机批量 resume**。
+- **T4 · 两轮合成闭环**：授权 Goal → 第一轮派单 → Mock DSH 结果 → 关联投递 → 原生队列触发新 turn →
+  第二轮派单 → 收尾或预算停止。必须验证 `deliveryId → subsequent dispatch` 的因果，**不许脚本直调两次
+  冒充自主续跑**；脚本化 Mock 模型只能证明调度链，不证明模型具备自主审计能力。
+  故障注入七项：busy 时通知到达、冷线程持久排队、投递前后崩溃、已发送但响应丢失、重复/乱序事件、
+  暂停 Goal 被尝试续跑、预算耗尽后仍有排队项。
+- **上下文纪律**：一会话一主目标；100–120k 起准备交接，150k 收尾提交，180k 必须交接。交接依据是本文件
+  + Git + 测试，**不是对话记忆**。
+- **授权边界**：特性分支内可自主实现/提交/推送；不得未审合并 `main`，不得部署到真实 DSH Web，不得改真实
+  业务会话；P0-b2 未完成前，"无人值守安全"一律不得宣称。
